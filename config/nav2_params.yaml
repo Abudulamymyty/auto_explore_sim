@@ -79,9 +79,9 @@ controller_server:
       wz_std: 0.2                           # Angular velocity noise
       # Velocity limits (TB3 Waffle hardware limits)
       vx_max: 1.0                        # Max forward speed (m/s)
-      vx_min: -0.5                         # Max reverse speed (m/s)
+      vx_min: -0.10                        # Barely allow reverse — forces rotate-in-place
       vy_max: 0.0                           # No lateral movement (diff drive)
-      wz_max: 1.5                           # Max angular velocity (rad/s)
+      wz_max: 1.9                           # Higher angular vel — faster in-place rotation (rad/s)
       iteration_count: 2                    # MPPI optimization iterations per cycle
       prune_distance: 1.7                   # Drop path points behind robot (m)
       transform_tolerance: 0.5              # TF lookup tolerance (s)
@@ -121,11 +121,12 @@ controller_server:
         cost_weight: 3.0
         threshold_to_consider: 0.5
 
-      # Penalizes reversing (encourages forward motion)
+      # Penalizes reversing — high weight forces robot to rotate in place
+      # then drive forward rather than backing up near walls
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        cost_weight: 15.0                   # Was 5.0 — strongly prefer forward motion
         threshold_to_consider: 0.5
 
       # Penalizes trajectories passing through high-cost costmap cells
@@ -259,12 +260,13 @@ global_costmap:
       # through narrow gaps when that's the only option
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # Moderate decay: cost drops but doorways still have some cost
-        # This makes planner prefer wider corridors when available
-        cost_scaling_factor: 5.0
-        # 0.40m inflation — doorway (0.8m) leaves 0.8 - 2*0.22 = 0.36m clearance
-        # which is within the inflation zone but still plannable
-        inflation_radius: 0.20
+        # Gentle decay so planner gets a smooth cost gradient.
+        # Lower scaling = cost drops off more slowly from obstacles
+        # → planner clearly "sees" walls from far away and routes around them
+        cost_scaling_factor: 3.0
+        # 0.40m > robot_radius (0.22m) → guaranteed gradient zone around all obstacles.
+        # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
+        inflation_radius: 0.40
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
@@ -279,8 +281,11 @@ map_saver:
     map_subscribe_transient_local: True
 
 # -----------------------------------------------------------------------------
-# Planner Server (NavFn with A*)
+# Planner Server (SmacPlanner2D)
 # Computes global path from current position to goal on the global costmap
+# Replaced NavFn because NavFn's gradient-descent path tracer fails when
+# the robot is near obstacles and the cost gradient is too sharp/flat.
+# SmacPlanner2D uses proper A* graph search — no gradient tracing issues.
 # -----------------------------------------------------------------------------
 planner_server:
   ros__parameters:
@@ -288,10 +293,21 @@ planner_server:
     planner_plugins: ["GridBased"]
     costmap_update_timeout: 1.0
     GridBased:
-      plugin: "nav2_navfn_planner::NavfnPlanner"
-      tolerance: 0.5                        # Goal search tolerance (cells) if exact goal is in obstacle
-      use_astar: true                       # A* is faster than Dijkstra for single-goal planning
+      plugin: "nav2_smac_planner::SmacPlanner2D"
+      tolerance: 0.125                      # Goal tolerance (m) — Smac can use tighter values
+      downsample_costmap: false             # Don't downsample — keep full resolution
+      downsampling_factor: 1
       allow_unknown: true                   # Plan through unknown space (needed for exploration)
+      max_iterations: 1000000               # Max A* search iterations
+      max_on_approach_iterations: 1000      # Max iterations once near goal
+      max_planning_time: 2.0                # Max planning time (s)
+      cost_travel_multiplier: 2.0           # How much to penalize high-cost cells
+      use_final_approach_orientation: false  # Let the controller handle final heading
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3                       # Smoothness weight
+        w_data: 0.2                         # Data fidelity weight
+        tolerance: 1.0e-10
 
 # -----------------------------------------------------------------------------
 # Smoother Server
@@ -345,8 +361,8 @@ velocity_smoother:
     smoothing_frequency: 20.0               # Must match controller_frequency
     scale_velocities: False                 # Don't scale down — just clip
     feedback: "OPEN_LOOP"                   # No odometry feedback (simpler)
-    max_velocity: [1.0, 0.0, 1.5]          # [vx, vy, wz] must match MPPI vx_max
-    min_velocity: [-0.5, 0.0, -1.5]       # Must match MPPI vx_min
+    max_velocity: [1.0, 0.0, 1.9]          # [vx, vy, wz] must match MPPI limits
+    min_velocity: [-0.10, 0.0, -1.9]      # Must match MPPI vx_min / wz_max
     max_accel: [1.5, 0.0, 2.5]             # [ax, ay, az] m/s², m/s², rad/s²
     max_decel: [-1.5, 0.0, -2.5]           # Symmetric braking
     odom_topic: "odom"
