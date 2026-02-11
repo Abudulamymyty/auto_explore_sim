@@ -1,0 +1,54 @@
+# =============================================================================
+# explore_lite (m-explore-ros2) Parameters
+# =============================================================================
+# Frontier-based autonomous exploration using Nav2 NavigateToPose action.
+# Finds frontiers (boundaries between known-free and unknown space),
+# picks the best one by cost, and sends it as a navigation goal.
+# =============================================================================
+
+explore_node:
+  ros__parameters:
+    robot_base_frame: base_link
+
+    # Topic names for the costmap used for frontier detection
+    # Uses the SLAM-generated /map (not Nav2's costmaps) so frontiers
+    # are detected on the raw occupancy grid
+    costmap_topic: map
+    costmap_updates_topic: map_updates
+
+    # Publish frontier markers to RViz (blue=active, red=blacklisted, green=centroids)
+    visualize: true
+
+    # How often to run frontier search and (re)select a goal (Hz)
+    # 0.1 = every 10 seconds. Lower = less churn, robot commits to current goal longer.
+    # Only matters when not navigating (our modified code skips replanning during navigation)
+    planner_frequency: 0.1
+
+    # If robot makes no progress for this many seconds, blacklist current goal
+    # and pick a new frontier. Prevents getting stuck forever on unreachable goals.
+    progress_timeout: 10.0
+
+    # --- Frontier cost function: cost = potential_scale * distance - gain_scale * size ---
+    # Higher potential_scale = prefer closer frontiers (less travel)
+    # Set high so distance dominates: robot explores nearby areas first before far ones
+    # Example: near(2m,20cells)=0.9 vs far(10m,200cells)=4.0 → near wins
+    potential_scale: 10.0
+    # orientation_scale: bonus for frontiers aligned with robot heading (0 = disabled)
+    orientation_scale: 0.0
+    # Low gain_scale = small bonus for larger frontiers, distance still dominates
+    gain_scale: 0.1
+
+    # TF lookup tolerance (seconds). Higher = more forgiving of TF delays
+    transform_tolerance: 2.0
+
+    # Ignore frontiers smaller than this (meters). Filters out tiny noise frontiers
+    # that appear from sensor artifacts or map edge effects.
+    min_frontier_size: 0.5
+
+    # Don't switch goals if the new best frontier is within this distance (m)
+    # of the current goal. Prevents centroid-drift-induced goal switching as
+    # SLAM updates shift frontier boundaries slightly.
+    goal_distance_hysteresis: 1.0
+
+    # Whether to navigate back to starting position after all frontiers are explored
+    return_to_init: false

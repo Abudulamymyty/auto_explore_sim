@@ -1,0 +1,391 @@
+# =============================================================================
+# Nav2 Parameters for TurtleBot3 Waffle Autonomous Exploration
+# =============================================================================
+# Robot specs: differential drive, radius ~0.22m, max linear 0.26 m/s
+# Tuned for: office environment with narrow doorways (~0.8m wide)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Behavior Tree Navigator
+# Manages high-level navigation logic using behavior trees
+# -----------------------------------------------------------------------------
+bt_navigator:
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10                    # BT tick rate (ms)
+    default_server_timeout: 20              # Timeout waiting for action servers (s)
+    wait_for_service_timeout: 1000          # Timeout waiting for services (ms)
+    action_server_result_timeout: 900.0     # How long to keep action results (s)
+    # Use replanning + recovery BT so Nav2 retries on failures instead of aborting
+    default_bt_xml_filename: "navigate_w_replanning_and_recovery.xml"
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+    error_code_names:
+      - compute_path_error_code
+      - follow_path_error_code
+
+# -----------------------------------------------------------------------------
+# Controller Server (MPPI)
+# Computes velocity commands to follow the global path
+# -----------------------------------------------------------------------------
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0              # Control loop rate (Hz)
+    costmap_update_timeout: 0.30            # Max wait for costmap update (s)
+    min_x_velocity_threshold: 0.001         # Below this = zero linear velocity
+    min_y_velocity_threshold: 0.5           # N/A for diff drive (no lateral)
+    min_theta_velocity_threshold: 0.001     # Below this = zero angular velocity
+    # Allow this many consecutive failures before aborting (1.0 = tolerate failures)
+    failure_tolerance: 1.0
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+    use_realtime_priority: false
+
+    # Checks if robot is making forward progress toward goal
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.3         # Must move at least this far...
+      movement_time_allowance: 15.0         # ...within this many seconds
+
+    # Determines when robot has "reached" the goal
+    general_goal_checker:
+      stateful: True                        # Once reached, stays reached
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.5                # Position tolerance (m) - relaxed for frontiers
+      yaw_goal_tolerance: 3.14              # Orientation tolerance (rad) - don't care about heading
+
+    # MPPI (Model Predictive Path Integral) controller
+    # Samples thousands of trajectories and picks the lowest-cost one
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56                        # Trajectory rollout length (steps)
+      model_dt: 0.05                        # Time between steps (s) → 56*0.05 = 2.8s lookahead
+      batch_size: 1000                      # Number of sampled trajectories per iteration
+      # Acceleration limits
+      ax_max: 2.5                           # Max forward acceleration (m/s²)
+      ax_min: -2.5                          # Max braking deceleration (m/s²)
+      ay_max: 1.0                           # Lateral accel (unused for DiffDrive)
+      ay_min: -1.0
+      az_max: 3.2                           # Max angular acceleration (rad/s²)
+      # Noise standard deviations for trajectory sampling
+      vx_std: 0.1                           # Linear velocity noise
+      vy_std: 0.1                           # Lateral velocity noise (unused)
+      wz_std: 0.2                           # Angular velocity noise
+      # Velocity limits (TB3 Waffle hardware limits)
+      vx_max: 1.0                        # Max forward speed (m/s)
+      vx_min: -0.5                         # Max reverse speed (m/s)
+      vy_max: 0.0                           # No lateral movement (diff drive)
+      wz_max: 1.5                           # Max angular velocity (rad/s)
+      iteration_count: 2                    # MPPI optimization iterations per cycle
+      prune_distance: 1.7                   # Drop path points behind robot (m)
+      transform_tolerance: 0.5              # TF lookup tolerance (s)
+      temperature: 0.5                      # Softmax temperature (lower = greedier)
+      gamma: 0.015                          # Free energy term weight
+      motion_model: "DiffDrive"             # Differential drive kinematics
+      visualize: false
+      regenerate_noises: false              # Reuse noise samples for speed
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+
+      # --- MPPI Critics ---
+      # Each critic scores sampled trajectories; weighted sum determines best path
+      critics: [
+        "ConstraintCritic", "CostCritic", "GoalCritic",
+        "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+        "PathAngleCritic", "PreferForwardCritic"]
+
+      # Penalizes trajectories violating kinematic constraints
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+
+      # Penalizes distance from goal (activates near goal)
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4          # Only active within this distance (m)
+
+      # Penalizes heading error at goal (activates very close to goal)
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+
+      # Penalizes reversing (encourages forward motion)
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+
+      # Penalizes trajectories passing through high-cost costmap cells
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        # IMPORTANT: lowered from 253 to allow passing through narrow doorways
+        # where inflation zones overlap — the robot is safe if within robot_radius
+        near_collision_cost: 200
+        critical_cost: 300.0
+        consider_footprint: false
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+        trajectory_point_step: 2
+
+      # Penalizes lateral deviation from the global path
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05      # Skip if path is mostly in obstacles
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+
+      # Penalizes distance from the furthest reachable path point
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+
+      # Penalizes heading deviation from path direction
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+
+# -----------------------------------------------------------------------------
+# Local Costmap
+# Small rolling window around the robot for reactive obstacle avoidance
+# Uses tighter inflation so robot can squeeze through doorways
+# -----------------------------------------------------------------------------
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0                 # Costmap update rate (Hz)
+      publish_frequency: 2.0                # Costmap publish rate (Hz)
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true                  # Moves with robot
+      width: 3                              # Window size (m)
+      height: 3
+      resolution: 0.05                      # Cell size (m) — matches SLAM
+      robot_radius: 0.22                    # TB3 Waffle inscribed radius (m)
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      # Marks/clears cells based on laser scan observations
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0           # Max range for clearing (m)
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5           # Max range for marking (m)
+          obstacle_min_range: 0.0
+
+      # Inflates obstacles to create a safety buffer
+      # TIGHT settings: small radius + fast decay = can navigate narrow passages
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # High scaling = cost drops off rapidly from obstacles
+        # At robot_radius (0.22m), cost ≈ 253*exp(-10*(0.30-0.22)) ≈ 113 (passable)
+        cost_scaling_factor: 10.0
+        # Only inflate 0.30m out from obstacles (was 0.55m — blocked doorways)
+        inflation_radius: 0.2
+      always_send_full_costmap: True
+
+# -----------------------------------------------------------------------------
+# Global Costmap
+# Full map used by the planner to compute paths to distant goals
+# Slightly wider inflation than local so paths prefer open corridors when possible
+# -----------------------------------------------------------------------------
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0                 # Lower rate to save CPU
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      robot_radius: 0.22
+      resolution: 0.05
+      track_unknown_space: true             # Mark unseen areas as unknown (for exploration)
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      # Subscribes to SLAM-generated map
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+
+      # Dynamic obstacles from laser scan
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+
+      # Wider inflation than local — planner prefers open paths but CAN plan
+      # through narrow gaps when that's the only option
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Moderate decay: cost drops but doorways still have some cost
+        # This makes planner prefer wider corridors when available
+        cost_scaling_factor: 5.0
+        # 0.40m inflation — doorway (0.8m) leaves 0.8 - 2*0.22 = 0.36m clearance
+        # which is within the inflation zone but still plannable
+        inflation_radius: 0.20
+      always_send_full_costmap: True
+
+# -----------------------------------------------------------------------------
+# Map Saver
+# Parameters for saving maps via map_saver_cli
+# -----------------------------------------------------------------------------
+map_saver:
+  ros__parameters:
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25               # Below this probability = free
+    occupied_thresh_default: 0.65           # Above this probability = occupied
+    map_subscribe_transient_local: True
+
+# -----------------------------------------------------------------------------
+# Planner Server (NavFn with A*)
+# Computes global path from current position to goal on the global costmap
+# -----------------------------------------------------------------------------
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 20.0
+    planner_plugins: ["GridBased"]
+    costmap_update_timeout: 1.0
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.5                        # Goal search tolerance (cells) if exact goal is in obstacle
+      use_astar: true                       # A* is faster than Dijkstra for single-goal planning
+      allow_unknown: true                   # Plan through unknown space (needed for exploration)
+
+# -----------------------------------------------------------------------------
+# Smoother Server
+# Smooths the global path to remove jagged edges
+# -----------------------------------------------------------------------------
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+# -----------------------------------------------------------------------------
+# Behavior Server
+# Recovery behaviors when robot gets stuck (spin, backup, wait)
+# -----------------------------------------------------------------------------
+behavior_server:
+  ros__parameters:
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 1.0
+    simulate_ahead_time: 2.0                # How far ahead to check for collisions (s)
+    max_rotational_vel: 1.0                 # Spin recovery max speed (rad/s)
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 1.6
+
+# -----------------------------------------------------------------------------
+# Velocity Smoother
+# Smooths commanded velocities to respect acceleration limits
+# Prevents jerky starts/stops
+# -----------------------------------------------------------------------------
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0               # Must match controller_frequency
+    scale_velocities: False                 # Don't scale down — just clip
+    feedback: "OPEN_LOOP"                   # No odometry feedback (simpler)
+    max_velocity: [1.0, 0.0, 1.5]          # [vx, vy, wz] must match MPPI vx_max
+    min_velocity: [-0.5, 0.0, -1.5]       # Must match MPPI vx_min
+    max_accel: [1.5, 0.0, 2.5]             # [ax, ay, az] m/s², m/s², rad/s²
+    max_decel: [-1.5, 0.0, -2.5]           # Symmetric braking
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]     # No deadband
+    velocity_timeout: 1.0                   # Stop if no cmd for this long (s)
+
+# -----------------------------------------------------------------------------
+# Collision Monitor
+# Last line of defense — slows/stops robot if obstacle is imminent
+# Uses the scan directly (not costmap) for fastest reaction
+# -----------------------------------------------------------------------------
+collision_monitor:
+  ros__parameters:
+    base_frame_id: "base_footprint"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"    # Input from velocity_smoother
+    cmd_vel_out_topic: "cmd_vel"            # Output to robot
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 1.0
+    source_timeout: 1.0
+    base_shift_correction: True
+    stop_pub_timeout: 2.0
+    polygons: ["FootprintApproach"]
+    FootprintApproach:
+      type: "polygon"
+      action_type: "approach"               # Slow down (not hard stop)
+      footprint_topic: "/local_costmap/published_footprint"
+      # Reduced from 1.2 to 0.8s — less conservative so robot doesn't
+      # freeze up at doorway entrances where walls are close on both sides
+      time_before_collision: 0.8
+      simulation_time_step: 0.1
+      min_points: 6                         # Ignore sparse noise
+      visualize: False
+      enabled: True
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "scan"
+      min_height: 0.15
+      max_height: 2.0
+      enabled: True

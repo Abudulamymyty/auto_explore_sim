@@ -1,0 +1,543 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="office">
+
+    <!-- Plugins -->
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+
+    <physics name="1ms" type="ode">
+      <max_step_size>0.003</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Lighting -->
+    <light name="sun" type="directional">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <scene>
+      <shadows>false</shadows>
+      <ambient>0.4 0.4 0.4 1</ambient>
+    </scene>
+
+    <!--
+      Office Layout (~15m x 12m), CENTERED so robot spawns at (0,0) in corridor.
+      World offset: (-7.5, -5.75) from original layout.
+
+      Layout sketch (world coords):
+      ================================================
+      |               |            |                  |
+      |  Office 1     |  Office 2  |   Meeting Room   |
+      | (-7.5 to -3.5)| (-3.5 to  |  (0.5 to 7.5,   |
+      |  (1.25-6.25)  |  0.5)     |   1.25-6.25)     |
+      |       D       |     D      |       D          |
+      ========= ======= ========= ========= ==========
+      |                                               |
+      |              C O R R I D O R                  |
+      |           (-7.5 to 7.5, -1.25 to 1.25)       |
+      |             Robot spawns at (0, 0)            |
+      ========= ======= ========= ========= ==========
+      |               |            |                  |
+      |  Reception    |  Kitchen   |    Storage       |
+      | (-7.5 to -2.5)| (-2.5 to  |  (2.5 to 7.5,   |
+      | (-5.75 to     |  2.5)     |  -5.75 to -1.25) |
+      | -1.25)        |           |                  |
+      ================================================
+
+      Wall thickness: 0.15m, height: 2.5m
+    -->
+
+    <!-- Walls model — pose offsets all child links by (-7.5, -5.75) -->
+    <model name="office_walls">
+      <static>true</static>
+      <pose>-7.5 -5.75 0 0 0 0</pose>
+
+      <!-- ===== OUTER WALLS ===== -->
+
+      <!-- South wall (y=0 in model frame) -->
+      <link name="wall_south">
+        <pose>7.5 0 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>15.15 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>15.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.85 1</ambient><diffuse>0.9 0.9 0.85 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- North wall (y=12) -->
+      <link name="wall_north">
+        <pose>7.5 12 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>15.15 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>15.15 0.15 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.85 1</ambient><diffuse>0.9 0.9 0.85 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- West wall (x=0) -->
+      <link name="wall_west">
+        <pose>0 6 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 12.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 12.15 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.85 1</ambient><diffuse>0.9 0.9 0.85 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- East wall (x=15) -->
+      <link name="wall_east">
+        <pose>15 6 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 12.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 12.15 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.85 1</ambient><diffuse>0.9 0.9 0.85 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- ===== CORRIDOR WALLS (horizontal dividers) ===== -->
+
+      <!-- South corridor wall (y=4.5) — with door gaps -->
+      <link name="corridor_south_seg1">
+        <pose>0.75 4.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>1.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_south_seg2">
+        <pose>4.5 4.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>4.0 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>4.0 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_south_seg3">
+        <pose>9.25 4.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>3.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>3.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_south_seg4">
+        <pose>13.5 4.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>3.0 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>3.0 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- North corridor wall (y=7) — with door gaps -->
+      <link name="corridor_north_seg1">
+        <pose>0.75 7 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>1.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_north_seg2">
+        <pose>3.75 7 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>2.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>2.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_north_seg3">
+        <pose>7.75 7 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>3.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>3.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+      <link name="corridor_north_seg4">
+        <pose>12.75 7 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>4.5 0.15 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>4.5 0.15 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- ===== INTERIOR VERTICAL WALLS ===== -->
+
+      <link name="div_bottom_1">
+        <pose>5 2.25 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 4.5 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 4.5 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+      <link name="div_bottom_2">
+        <pose>10 2.25 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 4.5 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 4.5 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+      <link name="div_top_1">
+        <pose>4 9.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 5.0 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.0 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+      <link name="div_top_2">
+        <pose>8 9.5 1.25 0 0 0</pose>
+        <collision name="collision">
+          <geometry><box><size>0.15 5.0 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.15 5.0 2.5</size></box></geometry>
+          <material><ambient>0.85 0.85 0.8 1</ambient><diffuse>0.85 0.85 0.8 1</diffuse></material>
+        </visual>
+      </link>
+
+    </model>
+
+    <!-- ===== FURNITURE (all coords shifted by -7.5, -5.75) ===== -->
+
+    <model name="reception_desk">
+      <static>true</static>
+      <pose>-5.0 -3.75 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.8 0.7 0.8</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.8 0.7 0.8</size></box></geometry>
+          <material><ambient>0.55 0.35 0.17 1</ambient><diffuse>0.55 0.35 0.17 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="reception_chair">
+      <static>true</static>
+      <pose>-5.0 -2.85 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="kitchen_table">
+      <static>true</static>
+      <pose>0.0 -3.75 0.38 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.2 1.2 0.76</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.2 1.2 0.76</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="kitchen_chair1">
+      <static>true</static>
+      <pose>-0.8 -3.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.6 1</ambient><diffuse>0.3 0.3 0.7 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="kitchen_chair2">
+      <static>true</static>
+      <pose>0.8 -3.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.6 1</ambient><diffuse>0.3 0.3 0.7 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="storage_shelf1">
+      <static>true</static>
+      <pose>5.0 -4.75 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>2.0 0.5 1.2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>2.0 0.5 1.2</size></box></geometry>
+          <material><ambient>0.4 0.3 0.2 1</ambient><diffuse>0.5 0.4 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="storage_shelf2">
+      <static>true</static>
+      <pose>5.0 -2.25 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>2.0 0.5 1.2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>2.0 0.5 1.2</size></box></geometry>
+          <material><ambient>0.4 0.3 0.2 1</ambient><diffuse>0.5 0.4 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="office1_desk">
+      <static>true</static>
+      <pose>-5.5 3.75 0.38 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.5 0.7 0.76</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.5 0.7 0.76</size></box></geometry>
+          <material><ambient>0.55 0.35 0.17 1</ambient><diffuse>0.55 0.35 0.17 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="office1_chair">
+      <static>true</static>
+      <pose>-5.5 4.65 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="office2_desk">
+      <static>true</static>
+      <pose>-1.5 3.75 0.38 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.5 0.7 0.76</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.5 0.7 0.76</size></box></geometry>
+          <material><ambient>0.55 0.35 0.17 1</ambient><diffuse>0.55 0.35 0.17 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="office2_chair">
+      <static>true</static>
+      <pose>-1.5 4.65 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.25</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="office2_bookshelf">
+      <static>true</static>
+      <pose>0.2 4.25 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.4 1.0 1.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 1.0 1.5</size></box></geometry>
+          <material><ambient>0.4 0.3 0.2 1</ambient><diffuse>0.5 0.4 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="meeting_table">
+      <static>true</static>
+      <pose>4.0 3.75 0.38 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>3.0 1.2 0.76</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>3.0 1.2 0.76</size></box></geometry>
+          <material><ambient>0.45 0.3 0.15 1</ambient><diffuse>0.5 0.35 0.2 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="meeting_chair1">
+      <static>true</static>
+      <pose>2.8 3.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="meeting_chair2">
+      <static>true</static>
+      <pose>5.2 3.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="meeting_chair3">
+      <static>true</static>
+      <pose>4.0 2.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="meeting_chair4">
+      <static>true</static>
+      <pose>4.0 4.75 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Corridor plant — offset from spawn point -->
+    <model name="corridor_plant">
+      <static>true</static>
+      <pose>2.0 0.0 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.2</radius><length>0.6</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.2</radius><length>0.6</length></cylinder></geometry>
+          <material><ambient>0.15 0.4 0.15 1</ambient><diffuse>0.2 0.5 0.2 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

@@ -1,0 +1,79 @@
+# =============================================================================
+# SLAM Toolbox Parameters (online_async mode)
+# =============================================================================
+# Performs simultaneous localization and mapping using laser scans.
+# online_async mode: processes scans in a background thread, doesn't block
+# the scan callback — best for real-time exploration where scans arrive fast.
+# =============================================================================
+
+slam_toolbox:
+  ros__parameters:
+
+    # --- Ceres Solver Configuration ---
+    # Ceres is used for graph optimization (minimizing pose graph error)
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY   # Good for sparse SLAM problems
+    ceres_preconditioner: SCHUR_JACOBI             # Preconditioner for iterative solver
+    ceres_trust_strategy: LEVENBERG_MARQUARDT      # LM is robust for nonlinear least squares
+    ceres_dogleg_type: TRADITIONAL_DOGLEG          # Dogleg variant (only used with dogleg strategy)
+    ceres_loss_function: None                      # No robust loss — trust scan matching
+
+    # --- ROS Frame & Topic Configuration ---
+    odom_frame: odom                # Odometry frame (from wheel encoders / sim)
+    map_frame: map                  # Output map frame
+    base_frame: base_footprint      # Robot base frame for TF lookups
+    scan_topic: /scan               # Input laser scan topic
+    use_map_saver: true             # Enable map saving via map_saver service
+    mode: mapping                   # "mapping" = build map; "localization" = use existing map
+
+    # --- Performance & Timing ---
+    debug_logging: false
+    throttle_scans: 1               # Process every Nth scan (1 = all scans)
+    transform_publish_period: 0.02  # How often to publish map->odom TF (s). 50Hz for smooth nav
+    map_update_interval: 3.0        # How often to publish updated map (s). 3s balances CPU vs freshness
+    resolution: 0.05                # Map cell size (m). 5cm matches Nav2 costmap resolution
+    max_laser_range: 20.0           # Ignore laser readings beyond this (m). TB3 LiDAR max range
+    minimum_time_interval: 0.5      # Min time between processed scans (s). Prevents overloading
+    transform_timeout: 0.2          # TF lookup timeout (s)
+    tf_buffer_duration: 30.0        # TF buffer history length (s)
+    stack_size_to_use: 40000000     # Thread stack size (bytes). 40MB for large maps
+    enable_interactive_mode: true   # Allow interactive pose adjustment in RViz
+
+    # --- Scan Matching & Graph Building ---
+    use_scan_matching: true         # Match scans to refine odometry (essential for accuracy)
+    use_scan_barycenter: true       # Use scan center of mass for matching (more robust)
+    minimum_travel_distance: 0.3    # Min distance (m) before adding a new scan node to the graph
+    minimum_travel_heading: 0.3     # Min rotation (rad, ~17 deg) before adding a new node
+    scan_buffer_size: 10            # Number of scans kept in buffer for matching
+    scan_buffer_maximum_scan_distance: 10.0  # Max distance (m) between buffered scans
+    link_match_minimum_response_fine: 0.1    # Min correlation score for fine scan matching
+    link_scan_maximum_distance: 1.5          # Max distance (m) to search for scan-to-scan links
+    loop_search_maximum_distance: 3.0        # Max distance (m) to search for loop closure candidates
+    do_loop_closing: true                    # Enable loop closure detection (corrects drift)
+    loop_match_minimum_chain_size: 10        # Min chain length to consider for loop closure
+    loop_match_maximum_variance_coarse: 3.0  # Max variance for coarse loop match
+    loop_match_minimum_response_coarse: 0.35 # Min correlation for coarse loop match
+    loop_match_minimum_response_fine: 0.45   # Min correlation for fine loop match (stricter)
+
+    # --- Correlation Search Space (scan-to-scan matching) ---
+    # Defines the search window for aligning consecutive scans
+    correlation_search_space_dimension: 0.5       # Search window size (m). 0.5m around current pose
+    correlation_search_space_resolution: 0.01     # Search step size (m). 1cm precision
+    correlation_search_space_smear_deviation: 0.1 # Gaussian smear for correlation (robustness)
+
+    # --- Loop Closure Search Space ---
+    # Wider search window for finding loop closures (revisited areas)
+    loop_search_space_dimension: 8.0              # Search window (m). 8m — detects large loops
+    loop_search_space_resolution: 0.05            # Search step (m). 5cm — coarser than correlation
+    loop_search_space_smear_deviation: 0.03       # Tighter smear for precision
+
+    # --- Scan Matcher Penalties ---
+    # Control how aggressively the matcher penalizes large corrections
+    distance_variance_penalty: 0.5      # Penalize large translational corrections
+    angle_variance_penalty: 1.0         # Penalize large rotational corrections (stricter)
+    fine_search_angle_offset: 0.00349   # Fine search range (rad, ~0.2 deg)
+    coarse_search_angle_offset: 0.349   # Coarse search range (rad, ~20 deg)
+    coarse_angle_resolution: 0.0349     # Coarse search step (rad, ~2 deg)
+    minimum_angle_penalty: 0.9          # Min penalty for angular deviation (near 1.0 = strict)
+    minimum_distance_penalty: 0.5       # Min penalty for distance deviation (moderate)
+    use_response_expansion: true        # Expand search if initial match is poor
