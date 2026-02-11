@@ -40,18 +40,20 @@ controller_server:
     min_x_velocity_threshold: 0.001         # Below this = zero linear velocity
     min_y_velocity_threshold: 0.5           # N/A for diff drive (no lateral)
     min_theta_velocity_threshold: 0.001     # Below this = zero angular velocity
-    # Allow this many consecutive failures before aborting (1.0 = tolerate failures)
-    failure_tolerance: 1.0
+    # High tolerance: don't abort just because the planner/controller has
+    # transient failures. Only give up when progress_checker says we're stuck.
+    failure_tolerance: 10.0
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
     use_realtime_priority: false
 
     # Checks if robot is making forward progress toward goal
+    # Relaxed: give the robot more time to push through tight spots
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.3         # Must move at least this far...
-      movement_time_allowance: 15.0         # ...within this many seconds
+      required_movement_radius: 0.15        # Even tiny movement counts as progress (m)
+      movement_time_allowance: 20.0         # 20s to move 0.15m — very patient
 
     # Determines when robot has "reached" the goal
     general_goal_checker:
@@ -83,9 +85,9 @@ controller_server:
       vy_max: 0.0                           # No lateral movement (diff drive)
       wz_max: 1.9                           # Higher angular vel — faster in-place rotation (rad/s)
       iteration_count: 2                    # MPPI optimization iterations per cycle
-      prune_distance: 1.7                   # Drop path points behind robot (m)
+      prune_distance: 2.5                   # Keep more path behind robot — stabilizes path commitment (m)
       transform_tolerance: 0.5              # TF lookup tolerance (s)
-      temperature: 0.5                      # Softmax temperature (lower = greedier)
+      temperature: 0.3                      # Lower = greedier, less random path-switching
       gamma: 0.015                          # Free energy term weight
       motion_model: "DiffDrive"             # Differential drive kinematics
       visualize: false
@@ -129,14 +131,16 @@ controller_server:
         cost_weight: 15.0                   # Was 5.0 — strongly prefer forward motion
         threshold_to_consider: 0.5
 
-      # Penalizes trajectories passing through high-cost costmap cells
+      # Penalizes trajectories passing through high-cost costmap cells.
+      # Now that local costmap has a proper inflation gradient (0.22→0.40m),
+      # this critic actively steers MPPI away from walls before getting close.
+      # Weight increased so the robot maintains clearance in open areas but
+      # near_collision_cost kept high so it can still push through narrow gaps.
       CostCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.81
-        # IMPORTANT: lowered from 253 to allow passing through narrow doorways
-        # where inflation zones overlap — the robot is safe if within robot_radius
-        near_collision_cost: 200
+        cost_weight: 5.0                    # Was 3.81 — stronger wall repulsion
+        near_collision_cost: 240             # Only panic very close to lethal (253)
         critical_cost: 300.0
         consider_footprint: false
         collision_cost: 1000000.0
@@ -144,22 +148,24 @@ controller_server:
         trajectory_point_step: 2
 
       # Penalizes lateral deviation from the global path
+      # HIGH weight = robot commits to the current path, won't oscillate
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 14.0
-        max_path_occupancy_ratio: 0.05      # Skip if path is mostly in obstacles
+        cost_weight: 22.0                   # Was 14.0 — strongly stick to current path
+        max_path_occupancy_ratio: 0.40      # Was 0.05 — still follow path even if 40% is in obstacles
         trajectory_point_step: 4
         threshold_to_consider: 0.5
         offset_from_furthest: 20
         use_path_orientations: false
 
       # Penalizes distance from the furthest reachable path point
+      # Looks far ahead on the current path — anchors commitment to the chosen route
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
-        offset_from_furthest: 5
+        cost_weight: 12.0                   # Was 5.0 — pull strongly toward furthest path point
+        offset_from_furthest: 20            # Was 5 — look 20 points ahead (≈1m at 0.05 res)
         threshold_to_consider: 1.4
 
       # Penalizes heading deviation from path direction
@@ -208,14 +214,18 @@ local_costmap:
           obstacle_min_range: 0.0
 
       # Inflates obstacles to create a safety buffer
-      # TIGHT settings: small radius + fast decay = can navigate narrow passages
+      # CRITICAL for MPPI: the inflation zone IS the gradient that lets the
+      # controller "feel" walls and steer away. Without it, cost jumps 0→253
+      # with no transition and the robot drifts into lethal zones.
+      #
+      # Cost at distance d from obstacle:
+      #   cost = 253 * exp(-5.0 * (d - 0.22))
+      #   d=0.22m → 253 (lethal)    d=0.30m → 170    d=0.40m → 103
+      # → smooth gradient from 0.22m to 0.40m that MPPI can follow
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # High scaling = cost drops off rapidly from obstacles
-        # At robot_radius (0.22m), cost ≈ 253*exp(-10*(0.30-0.22)) ≈ 113 (passable)
-        cost_scaling_factor: 10.0
-        # Only inflate 0.30m out from obstacles (was 0.55m — blocked doorways)
-        inflation_radius: 0.2
+        cost_scaling_factor: 5.0            # Moderate decay — gradient extends further
+        inflation_radius: 0.40              # MPPI sees walls from 0.40m away
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
@@ -230,7 +240,11 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.22
+      # SMALLER than real radius (0.22m) on purpose!
+      # This shrinks the inscribed lethal zone so the planner doesn't refuse
+      # to plan when the robot is near a wall ("Start occupied" fix).
+      # Real safety comes from local costmap (0.22m) + collision monitor.
+      robot_radius: 0.15
       resolution: 0.05
       track_unknown_space: true             # Mark unseen areas as unknown (for exploration)
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -294,14 +308,14 @@ planner_server:
     costmap_update_timeout: 1.0
     GridBased:
       plugin: "nav2_smac_planner::SmacPlanner2D"
-      tolerance: 0.125                      # Goal tolerance (m) — Smac can use tighter values
+      tolerance: 1.0                        # Search up to 1.0m around goal for a free cell
       downsample_costmap: false             # Don't downsample — keep full resolution
       downsampling_factor: 1
       allow_unknown: true                   # Plan through unknown space (needed for exploration)
       max_iterations: 1000000               # Max A* search iterations
-      max_on_approach_iterations: 1000      # Max iterations once near goal
-      max_planning_time: 2.0                # Max planning time (s)
-      cost_travel_multiplier: 2.0           # How much to penalize high-cost cells
+      max_on_approach_iterations: 1500      # More iterations near goal → finds reachable spot
+      max_planning_time: 3.0                # Slightly more time for difficult goals (s)
+      cost_travel_multiplier: 3.0           # Stronger obstacle avoidance during planning
       use_final_approach_orientation: false  # Let the controller handle final heading
       smoother:
         max_iterations: 1000
@@ -346,9 +360,12 @@ behavior_server:
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 1.0
-    simulate_ahead_time: 2.0                # How far ahead to check for collisions (s)
+    # REDUCED from 2.0 — in tight spaces 2s lookahead makes backup/spin
+    # think they'll collide and refuse to execute. 0.8s is enough to be safe
+    # while still allowing recovery in narrow corridors.
+    simulate_ahead_time: 0.8
     max_rotational_vel: 1.0                 # Spin recovery max speed (rad/s)
-    min_rotational_vel: 0.4
+    min_rotational_vel: 0.2                 # Was 0.4 — slower spin for tight spaces
     rotational_acc_lim: 1.6
 
 # -----------------------------------------------------------------------------
@@ -386,16 +403,28 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: True
     stop_pub_timeout: 2.0
-    polygons: ["FootprintApproach"]
+    # Two-zone collision protection:
+    #   PolygonStop  → emergency hard stop at ~0.25s from impact (last resort)
+    #   FootprintApproach → gentle slowdown at ~0.5s (normal avoidance)
+    # In narrow corridors, approach zone lets robot creep through slowly
+    # instead of freezing completely, while stop zone prevents actual crashes.
+    polygons: ["PolygonStop", "FootprintApproach"]
+    PolygonStop:
+      type: "polygon"
+      action_type: "stop"                   # HARD STOP — about to crash
+      footprint_topic: "/local_costmap/published_footprint"
+      time_before_collision: 0.25           # Only 0.25s — very close range
+      simulation_time_step: 0.05
+      min_points: 4
+      visualize: False
+      enabled: True
     FootprintApproach:
       type: "polygon"
-      action_type: "approach"               # Slow down (not hard stop)
+      action_type: "approach"               # Slow down proportionally
       footprint_topic: "/local_costmap/published_footprint"
-      # Reduced from 1.2 to 0.8s — less conservative so robot doesn't
-      # freeze up at doorway entrances where walls are close on both sides
-      time_before_collision: 0.8
+      time_before_collision: 0.5            # Was 0.8 — less conservative
       simulation_time_step: 0.1
-      min_points: 6                         # Ignore sparse noise
+      min_points: 6
       visualize: False
       enabled: True
     observation_sources: ["scan"]
