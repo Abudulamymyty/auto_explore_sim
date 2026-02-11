@@ -280,7 +280,7 @@ global_costmap:
         cost_scaling_factor: 3.0
         # 0.40m > robot_radius (0.22m) → guaranteed gradient zone around all obstacles.
         # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
-        inflation_radius: 0.40
+        inflation_radius: 0.30
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
@@ -408,16 +408,16 @@ collision_monitor:
     #   FootprintApproach → gentle slowdown at ~0.5s (normal avoidance)
     # In narrow corridors, approach zone lets robot creep through slowly
     # instead of freezing completely, while stop zone prevents actual crashes.
-    polygons: ["PolygonStop", "FootprintApproach"]
-    PolygonStop:
-      type: "polygon"
-      action_type: "stop"                   # HARD STOP — about to crash
-      footprint_topic: "/local_costmap/published_footprint"
-      time_before_collision: 0.25           # Only 0.25s — very close range
-      simulation_time_step: 0.05
-      min_points: 4
-      visualize: False
-      enabled: True
+    polygons: [ "FootprintApproach"]
+    # PolygonStop:
+    #   type: "polygon"
+    #   action_type: "stop"                   # HARD STOP — about to crash
+    #   footprint_topic: "/local_costmap/published_footprint"
+    #   time_before_collision: 0.25           # Only 0.25s — very close range
+    #   simulation_time_step: 0.05
+    #   min_points: 4
+    #   visualize: False
+    #   enabled: True
     FootprintApproach:
       type: "polygon"
       action_type: "approach"               # Slow down proportionally
