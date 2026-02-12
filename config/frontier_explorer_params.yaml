@@ -5,7 +5,9 @@
 # Searches outward from robot position, picks nearest frontier with GVD
 # clearance tiebreaking (prefers frontiers in wider corridors).
 #
-# cost = min_distance - clearance_scale * clearance_at_centroid
+# cost = min_distance
+#      - clearance_scale * clearance_at_goal
+#      - orientation_scale * heading_bonus
 #
 # Control:  publish Bool to 'explore/resume' to stop (false) / resume (true)
 # =============================================================================
@@ -26,7 +28,7 @@ frontier_explorer:
 
     # Minimum number of frontier cells in a cluster to be considered
     # a valid frontier. Filters noise / tiny gaps.
-    min_frontier_size: 5
+    min_frontier_size: 10
 
     # --- GVD clearance tiebreaker ---
     # Among roughly equidistant frontiers, prefer those in wider corridors.
@@ -35,9 +37,44 @@ frontier_explorer:
     # Set to 0.0 to disable (pure nearest-first).
     clearance_scale: 0.2
 
+    # --- GVD skeleton goal projection ---
+    # After ranking frontiers normally, project ONLY the selected goal
+    # onto the nearest Voronoi skeleton point to stay near corridor center.
+    gvd_goal_on_skeleton: true
+    gvd_projection_radius: 0.0  # <=0 means unlimited search for nearest edge
+    gvd_min_clearance: 0.1
+    gvd_visualize: true
+    gvd_marker_stride: 2
+    gvd_marker_scale: 0.03
+
+    # --- Heading alignment preference ---
+    # Prefer goals that are in front of robot heading.
+    # Goals inside +/- orientation_window_deg are rewarded, with max reward
+    # when straight ahead and zero reward at the cone edge.
+    orientation_scale: 0.5
+    orientation_window_deg: 60.0
+
     # If no movement > 0.3 m within this many seconds, cancel goal
     # and blacklist the frontier.
     progress_timeout: 30.0
+
+    # If stuck near walls for progress_timeout, send a temporary recovery
+    # goal to a more spacious nearby area, then resume frontier replanning.
+    stuck_escape_enabled: true
+    near_wall_clearance: 0.35
+    stuck_escape_search_radius: 2.5
+    stuck_escape_min_goal_distance: 0.6
+    stuck_escape_min_clearance: 0.5
+    stuck_escape_distance_weight: 0.2
+
+    # Reject frontier goals that are too close to the robot. This avoids
+    # immediate goal success loops when goal tolerance is larger than
+    # local frontier motion.
+    min_goal_distance: 0.5
+
+    # If the selected goal remains unchanged, wait this long before allowing
+    # a resend. Prevents tight loops while also avoiding permanent stalls.
+    same_goal_cooldown: 4.0
 
     # Blacklisted frontier expiry time (seconds). After this long the
     # frontier can be targeted again.
@@ -46,6 +83,16 @@ frontier_explorer:
     # Radius around a blacklisted point (m). Any frontier centroid
     # within this radius is also considered blacklisted.
     blacklist_radius: 0.5
+
+    # Nav2 costmap topics used to reject frontier goals that land in
+    # obstacle / inscribed / unknown cells.
+    global_costmap_topic: global_costmap/costmap_raw
+    local_costmap_topic: local_costmap/costmap_raw
+
+    # Cost threshold on Nav2 costmap values [0..255].
+    # 253=inscribed, 254=lethal obstacle, 255=unknown.
+    costmap_obstacle_threshold: 253
+    treat_unknown_as_obstacle: false
 
     # When true, the robot navigates back to its starting pose after
     # all frontiers are exhausted.

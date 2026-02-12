@@ -59,7 +59,7 @@ controller_server:
     general_goal_checker:
       stateful: True                        # Once reached, stays reached
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.5                # Position tolerance (m) - relaxed for frontiers
+      xy_goal_tolerance: 0.5                # Position tolerance (m) - avoids instant success loops
       yaw_goal_tolerance: 3.14              # Orientation tolerance (rad) - don't care about heading
 
     # MPPI (Model Predictive Path Integral) controller
@@ -70,11 +70,11 @@ controller_server:
       model_dt: 0.05                        # Time between steps (s) → 56*0.05 = 2.8s lookahead
       batch_size: 1000                      # Number of sampled trajectories per iteration
       # Acceleration limits
-      ax_max: 2.5                           # Max forward acceleration (m/s²)
-      ax_min: -2.5                          # Max braking deceleration (m/s²)
+      ax_max: 3.5                           # Faster acceleration to commit through tight spots
+      ax_min: -3.5                          # Symmetric braking authority
       ay_max: 1.0                           # Lateral accel (unused for DiffDrive)
       ay_min: -1.0
-      az_max: 3.2                           # Max angular acceleration (rad/s²)
+      az_max: 4.0                           # Faster turn-in near obstacles
       # Noise standard deviations for trajectory sampling
       vx_std: 0.1                           # Linear velocity noise
       vy_std: 0.1                           # Lateral velocity noise (unused)
@@ -139,8 +139,8 @@ controller_server:
       CostCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0                    # Was 3.81 — stronger wall repulsion
-        near_collision_cost: 240             # Only panic very close to lethal (253)
+        cost_weight: 3.0                    # Less conservative around inflated cells
+        near_collision_cost: 252             # Slow down only very close to lethal band
         critical_cost: 300.0
         consider_footprint: false
         collision_cost: 1000000.0
@@ -164,7 +164,7 @@ controller_server:
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 12.0                   # Was 5.0 — pull strongly toward furthest path point
+        cost_weight: 14.0                   # Slightly stronger path commitment at higher speed
         offset_from_furthest: 20            # Was 5 — look 20 points ahead (≈1m at 0.05 res)
         threshold_to_consider: 1.4
 
@@ -277,7 +277,7 @@ global_costmap:
         # Gentle decay so planner gets a smooth cost gradient.
         # Lower scaling = cost drops off more slowly from obstacles
         # → planner clearly "sees" walls from far away and routes around them
-        cost_scaling_factor: 4.0
+        cost_scaling_factor: 5.0
         # 0.40m > robot_radius (0.22m) → guaranteed gradient zone around all obstacles.
         # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
         inflation_radius: 0.20
@@ -289,7 +289,7 @@ global_costmap:
       voronoi_layer:
         plugin: "nav2_voronoi_layer::VoronoiLayer"
         enabled: true
-        max_cost: 120.0           # Extra cost at min_clearance distance (0-252)
+        max_cost: 150.0           # Extra cost at min_clearance distance (0-252)
         decay_factor: 3.0        # Exponential decay rate toward corridor center
         min_clearance: 0.22      # Don't add cost within inscribed radius (m)
       always_send_full_costmap: True
@@ -375,8 +375,8 @@ behavior_server:
     # think they'll collide and refuse to execute. 0.8s is enough to be safe
     # while still allowing recovery in narrow corridors.
     simulate_ahead_time: 0.8
-    max_rotational_vel: 1.0                 # Spin recovery max speed (rad/s)
-    min_rotational_vel: 0.2                 # Was 0.4 — slower spin for tight spaces
+    max_rotational_vel: 2.0                 # Spin recovery max speed (rad/s)
+    min_rotational_vel: 0.5                 # Was 0.4 — slower spin for tight spaces
     rotational_acc_lim: 1.6
 
 # -----------------------------------------------------------------------------
@@ -391,8 +391,8 @@ velocity_smoother:
     feedback: "OPEN_LOOP"                   # No odometry feedback (simpler)
     max_velocity: [1.0, 0.0, 1.9]          # [vx, vy, wz] must match MPPI limits
     min_velocity: [-0.10, 0.0, -1.9]      # Must match MPPI vx_min / wz_max
-    max_accel: [1.5, 0.0, 2.5]             # [ax, ay, az] m/s², m/s², rad/s²
-    max_decel: [-1.5, 0.0, -2.5]           # Symmetric braking
+    max_accel: [2.5, 0.0, 3.2]             # More responsive accel tracking
+    max_decel: [-2.5, 0.0, -3.2]           # Match accel for sharper speed changes
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]     # No deadband
@@ -433,9 +433,9 @@ collision_monitor:
       type: "polygon"
       action_type: "approach"               # Slow down proportionally
       footprint_topic: "/local_costmap/published_footprint"
-      time_before_collision: 0.5            # Was 0.8 — less conservative
-      simulation_time_step: 0.1
-      min_points: 6
+      time_before_collision: 0.25           # More aggressive near obstacles
+      simulation_time_step: 0.05
+      min_points: 4
       visualize: False
       enabled: True
     observation_sources: ["scan"]
