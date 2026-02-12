@@ -27,7 +27,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import Bool
 from nav2_msgs.action import NavigateToPose
 from visualization_msgs.msg import Marker, MarkerArray
@@ -71,10 +71,14 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('transform_tolerance', 2.0)
         self.declare_parameter('blacklist_radius', 0.5)          # metres
         self.declare_parameter('blacklist_timeout', 60.0)        # seconds
+        # arrival_radius removed — we now blacklist frontier on every success
         self.declare_parameter('progress_timeout', 30.0)
         self.declare_parameter('visualize', True)
         self.declare_parameter('clearance_scale', 0.3)       # GVD clearance tiebreaker
         self.declare_parameter('return_to_init', False)
+        self.declare_parameter('gvd_min_clearance', 3)     # min obstacle dist (cells)
+        self.declare_parameter('gvd_snap_radius', 2.0)     # max snap search (metres)
+        self.declare_parameter('visualize_gvd', True)
 
         # ── Read parameters ─────────────────────────────────────────────
         self.planner_freq = self.get_parameter('planner_frequency').value
@@ -84,10 +88,14 @@ class FrontierExplorerNode(Node):
         self.tf_tolerance = self.get_parameter('transform_tolerance').value
         self.blacklist_radius = self.get_parameter('blacklist_radius').value
         self.blacklist_timeout = self.get_parameter('blacklist_timeout').value
+        # arrival_radius removed
         self.progress_timeout = self.get_parameter('progress_timeout').value
         self.visualize = self.get_parameter('visualize').value
         self.clearance_scale = self.get_parameter('clearance_scale').value
         self.return_to_init = self.get_parameter('return_to_init').value
+        self.gvd_min_clearance = self.get_parameter('gvd_min_clearance').value
+        self.gvd_snap_radius = self.get_parameter('gvd_snap_radius').value
+        self.visualize_gvd = self.get_parameter('visualize_gvd').value
 
         # ── TF listener ─────────────────────────────────────────────────
         self.tf_buffer = tf2_ros.Buffer()
@@ -113,10 +121,14 @@ class FrontierExplorerNode(Node):
         if self.visualize:
             self.marker_pub = self.create_publisher(
                 MarkerArray, 'explore/frontiers', 10)
+        if self.visualize_gvd:
+            self.gvd_marker_pub = self.create_publisher(
+                MarkerArray, 'explore/gvd', 10)
 
         # ── State ───────────────────────────────────────────────────────
         self.navigating = False
-        self.current_goal = None            # (x, y) world coords
+        self.current_goal = None            # (x, y) snapped goal sent to Nav2
+        self.current_frontier = None        # (x, y) original frontier centroid
         self.prev_goal = None               # last goal sent to Nav2
         self.goal_handle = None
         self.blacklisted = []               # list of (x, y, stamp)
@@ -126,6 +138,8 @@ class FrontierExplorerNode(Node):
         self.initial_pose = None            # stored for return_to_init
         self._cached_dist_map = None        # GVD distance transform cache
         self._cached_map_stamp = None
+        self._cached_label_map = None       # obstacle label map for GVD
+        self._cached_gvd_mask = None        # boolean GVD point mask
 
         # ── Timer ───────────────────────────────────────────────────────
         period = 1.0 / max(self.planner_freq, 0.01)
@@ -135,6 +149,7 @@ class FrontierExplorerNode(Node):
             f'Frontier Explorer ready  (freq={self.planner_freq} Hz, '
             f'min_frontier={self.min_frontier_size} cells, '
             f'clearance_scale={self.clearance_scale}, '
+            f'gvd_snap_radius={self.gvd_snap_radius}m, '
             f'return_to_init={self.return_to_init})')
 
     # ================================================================
@@ -225,12 +240,25 @@ class FrontierExplorerNode(Node):
             f'min_dist={best.min_distance:.2f}m  size={best.size}  '
             f'cost={best.cost:.1f}')
 
-        # 6. Visualise
+        # 6. Visualise frontiers and GVD skeleton
         if self.visualize:
             self._publish_markers(valid, best)
+        if self.visualize_gvd:
+            self._publish_gvd_markers(map_array, info)
 
-        # 7. Same-goal detection — skip if goal hasn't changed
-        gx, gy = best.centroid
+        # 7. Snap frontier goal to nearest GVD point
+        gx, gy = self._snap_to_gvd(best.centroid, robot_xy, map_array, info)
+
+        # 8. Skip if goal is too close to robot (would cause instant-success loop)
+        dist_to_goal = math.hypot(gx - robot_xy[0], gy - robot_xy[1])
+        if dist_to_goal < 0.3:
+            self.get_logger().warning(
+                f'Goal ({gx:.2f}, {gy:.2f}) only {dist_to_goal:.2f}m away '
+                f'— blacklisting frontier')
+            self._blacklist_point(best.centroid[0], best.centroid[1])
+            return
+
+        # 9. Same-goal detection — skip if goal hasn't changed
         if self.prev_goal is not None:
             dx = gx - self.prev_goal[0]
             dy = gy - self.prev_goal[1]
@@ -238,7 +266,8 @@ class FrontierExplorerNode(Node):
                 self.get_logger().debug('Same goal as before — skipping')
                 return
 
-        # 8. Navigate
+        # 10. Navigate
+        self.current_frontier = best.centroid
         self._navigate_to(gx, gy)
 
     # ================================================================
@@ -426,7 +455,7 @@ class FrontierExplorerNode(Node):
         return None
 
     # ================================================================
-    # GVD distance transform
+    # GVD distance transform & Voronoi skeleton
     # ================================================================
 
     def _get_distance_transform(self, map_array):
@@ -437,42 +466,212 @@ class FrontierExplorerNode(Node):
                 and self._cached_dist_map.shape == map_array.shape):
             return self._cached_dist_map
 
-        self._cached_dist_map = self._compute_distance_transform(map_array)
+        self._cached_dist_map, self._cached_label_map = \
+            self._compute_distance_and_labels(map_array)
+        self._cached_gvd_mask = self._extract_gvd_mask(
+            self._cached_dist_map, self._cached_label_map, map_array)
         self._cached_map_stamp = stamp
         return self._cached_dist_map
 
-    def _compute_distance_transform(self, map_array):
+    def _get_gvd_mask(self, map_array):
+        """Return cached GVD boolean mask, recomputing if needed."""
+        # Ensure distance transform (and GVD) is up to date
+        self._get_distance_transform(map_array)
+        return self._cached_gvd_mask
+
+    def _compute_distance_and_labels(self, map_array):
         """
-        BFS distance transform from obstacles (Manhattan, in cells).
-        Obstacles: occupied (> 50) or unknown (-1).
-        Returns int32 array where dist[y,x] = cells to nearest obstacle.
+        Two-phase computation:
+        1. Connected-component labeling of real obstacle regions (8-connected)
+           Unknown cells (-1) are excluded — they are the exploration frontier,
+           not permanent obstacles, so they must not generate GVD lines.
+        2. BFS distance transform propagating region labels into free space
+
+        A GVD cell is then one whose neighbors were reached from different
+        obstacle regions — i.e. equidistant from 2+ distinct walls.
+
+        Returns (dist_map, label_map) where label_map holds the region ID
+        of the nearest obstacle region for every cell.
         """
         h, w = map_array.shape
-        obstacle = (map_array > 50) | (map_array == -1)
+        obstacle = map_array > 50  # only real obstacles, NOT unknown (-1)
 
+        # --- Phase 1: connected-component labeling of obstacle regions ---
+        region_id = np.full((h, w), -1, dtype=np.int32)
+        current_label = 0
+
+        for sy in range(h):
+            for sx in range(w):
+                if obstacle[sy, sx] and region_id[sy, sx] == -1:
+                    # BFS flood-fill this obstacle region (8-connected)
+                    cc_queue = deque()
+                    cc_queue.append((sx, sy))
+                    region_id[sy, sx] = current_label
+                    while cc_queue:
+                        cx, cy = cc_queue.popleft()
+                        for ddx in (-1, 0, 1):
+                            for ddy in (-1, 0, 1):
+                                if ddx == 0 and ddy == 0:
+                                    continue
+                                nx, ny = cx + ddx, cy + ddy
+                                if (0 <= nx < w and 0 <= ny < h
+                                        and obstacle[ny, nx]
+                                        and region_id[ny, nx] == -1):
+                                    region_id[ny, nx] = current_label
+                                    cc_queue.append((nx, ny))
+                    current_label += 1
+
+        self.get_logger().debug(
+            f'GVD: found {current_label} obstacle regions',
+            throttle_duration_sec=10.0)
+
+        # --- Phase 2: BFS distance transform with region labels ---
         dist = np.full((h, w), -1, dtype=np.int32)
+        label = np.full((h, w), -1, dtype=np.int32)
         queue = deque()
 
-        # Seed all obstacle cells
+        # Seed all obstacle cells with their region label
         obs_y, obs_x = np.where(obstacle)
         for i in range(len(obs_y)):
             y, x = int(obs_y[i]), int(obs_x[i])
             dist[y, x] = 0
+            label[y, x] = region_id[y, x]
             queue.append((x, y))
 
-        # 4-connected BFS
+        # 4-connected BFS — propagate distance and region label
         while queue:
             cx, cy = queue.popleft()
             nd = dist[cy, cx] + 1
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + dx, cy + dy
+            lbl = label[cy, cx]
+            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + ddx, cy + ddy
                 if 0 <= nx < w and 0 <= ny < h and dist[ny, nx] == -1:
                     dist[ny, nx] = nd
+                    label[ny, nx] = lbl
                     queue.append((nx, ny))
 
         # Cells still -1 (unreachable) get 0
         dist[dist < 0] = 0
-        return dist
+        return dist, label
+
+    def _extract_gvd_mask(self, dist_map, label_map, map_array):
+        """
+        Extract GVD (Voronoi skeleton) points.
+        A cell is a GVD point if:
+          1. It is a free cell (occupancy == 0), NOT unknown or obstacle
+          2. Its distance to the nearest obstacle >= gvd_min_clearance
+          3. At least one 4-connected neighbor has a different obstacle label
+        """
+        h, w = dist_map.shape
+        min_c = self.gvd_min_clearance
+        gvd = np.zeros((h, w), dtype=bool)
+
+        # Vectorised: check if any neighbor has a different label
+        for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            if ddx == 1:
+                src = label_map[:, :-1]
+                nbr = label_map[:, 1:]
+                dst = gvd[:, :-1]
+            elif ddx == -1:
+                src = label_map[:, 1:]
+                nbr = label_map[:, :-1]
+                dst = gvd[:, 1:]
+            elif ddy == 1:
+                src = label_map[:-1, :]
+                nbr = label_map[1:, :]
+                dst = gvd[:-1, :]
+            else:  # ddy == -1
+                src = label_map[1:, :]
+                nbr = label_map[:-1, :]
+                dst = gvd[1:, :]
+            diff = (src != nbr) & (src >= 0) & (nbr >= 0)
+            dst |= diff
+
+        # Only keep GVD points in FREE cells (== 0), not unknown (-1)
+        gvd &= (map_array == 0)
+
+        # Apply clearance threshold
+        gvd &= (dist_map >= min_c)
+
+        return gvd
+
+    def _snap_to_gvd(self, point, robot_xy, map_array, info):
+        """
+        Snap a frontier centroid to the nearest GVD cell that lies
+        *between* the robot and the frontier (not behind the robot).
+        Returns (x, y) in world coordinates.
+        Falls back to the original point if no suitable GVD cell is found.
+        """
+        gvd_mask = self._get_gvd_mask(map_array)
+        if gvd_mask is None:
+            return point
+
+        resolution = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        w = info.width
+        h = info.height
+
+        # Convert point to map cell
+        px = int((point[0] - ox) / resolution)
+        py = int((point[1] - oy) / resolution)
+        px = max(0, min(w - 1, px))
+        py = max(0, min(h - 1, py))
+
+        # If already on GVD, return as-is
+        if gvd_mask[py, px]:
+            return point
+
+        # Distance from robot to frontier (for filtering candidates)
+        robot_to_frontier = math.hypot(
+            point[0] - robot_xy[0], point[1] - robot_xy[1])
+
+        # BFS outward from frontier centroid to find nearest GVD cell
+        max_cells = int(self.gvd_snap_radius / resolution)
+        visited = set()
+        queue = deque()
+        queue.append((px, py))
+        visited.add((px, py))
+
+        best_gvd = None
+        best_dist = float('inf')
+
+        while queue:
+            cx, cy = queue.popleft()
+            if gvd_mask[cy, cx]:
+                wx = cx * resolution + ox
+                wy = cy * resolution + oy
+                # Reject candidates that are farther from the frontier
+                # than the robot is (i.e. behind the robot)
+                cand_to_frontier = math.hypot(wx - point[0], wy - point[1])
+                if cand_to_frontier < best_dist:
+                    # Ensure candidate is not behind the robot:
+                    # candidate-to-frontier must be less than robot-to-frontier
+                    cand_to_robot = math.hypot(wx - robot_xy[0], wy - robot_xy[1])
+                    if cand_to_robot < robot_to_frontier:
+                        best_gvd = (wx, wy)
+                        best_dist = cand_to_frontier
+
+            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + ddx, cy + ddy
+                if (0 <= nx < w and 0 <= ny < h
+                        and (nx, ny) not in visited
+                        and abs(nx - px) <= max_cells
+                        and abs(ny - py) <= max_cells):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+
+        if best_gvd is not None:
+            self.get_logger().info(
+                f'Frontier snapped to GVD: '
+                f'({point[0]:.2f}, {point[1]:.2f}) -> '
+                f'({best_gvd[0]:.2f}, {best_gvd[1]:.2f})')
+            return best_gvd
+
+        self.get_logger().debug(
+            f'No valid GVD point within {self.gvd_snap_radius}m '
+            f'— using original centroid')
+        return point
 
     # ================================================================
     # Navigation
@@ -542,6 +741,14 @@ class FrontierExplorerNode(Node):
             # 4 = SUCCEEDED, 5 = CANCELED, 6 = ABORTED
             if status == 4:
                 self.get_logger().info('Navigation succeeded')
+                # Always blacklist the frontier centroid after success.
+                # If the frontier was truly explored, it vanishes from
+                # BFS naturally and the blacklist entry is harmless.
+                # If Nav2 "succeeded" via goal tolerance without actually
+                # reaching it, the blacklist prevents an infinite loop.
+                if self.current_frontier is not None:
+                    self._blacklist_point(
+                        self.current_frontier[0], self.current_frontier[1])
             elif status == 6:
                 self.get_logger().warning('Navigation aborted — blacklisting goal')
                 self._blacklist_current_goal()
@@ -610,12 +817,11 @@ class FrontierExplorerNode(Node):
 
     def _blacklist_current_goal(self):
         if self.current_goal is not None:
-            self.get_logger().info(
-                f'Blacklisting ({self.current_goal[0]:.2f}, '
-                f'{self.current_goal[1]:.2f})')
-            self.blacklisted.append(
-                (self.current_goal[0], self.current_goal[1],
-                 self.get_clock().now()))
+            self._blacklist_point(self.current_goal[0], self.current_goal[1])
+
+    def _blacklist_point(self, x, y):
+        self.get_logger().info(f'Blacklisting ({x:.2f}, {y:.2f})')
+        self.blacklisted.append((x, y, self.get_clock().now()))
 
     def _is_blacklisted(self, x, y):
         for bx, by, _ in self.blacklisted:
@@ -646,6 +852,77 @@ class FrontierExplorerNode(Node):
     # ================================================================
     # Visualisation
     # ================================================================
+
+    def _publish_gvd_markers(self, map_array, info):
+        """Publish GVD skeleton as connected LINE_LIST markers."""
+        gvd_mask = self._get_gvd_mask(map_array)
+        if gvd_mask is None:
+            return
+
+        resolution = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        h, w = gvd_mask.shape
+
+        ma = MarkerArray()
+
+        # Delete old GVD markers
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        delete_marker.ns = 'gvd'
+        ma.markers.append(delete_marker)
+
+        # Build LINE_LIST: for each GVD cell, connect to GVD neighbors
+        line_marker = Marker()
+        line_marker.header.frame_id = self.global_frame
+        line_marker.header.stamp = self.get_clock().now().to_msg()
+        line_marker.ns = 'gvd'
+        line_marker.id = 1
+        line_marker.type = Marker.LINE_LIST
+        line_marker.action = Marker.ADD
+        line_marker.scale.x = 0.02  # line width
+        line_marker.color.r = 0.0
+        line_marker.color.g = 1.0
+        line_marker.color.b = 1.0
+        line_marker.color.a = 0.8
+        line_marker.lifetime.sec = 10
+        line_marker.pose.orientation.w = 1.0
+
+        # 4-connected: only check right and down to avoid duplicate edges
+        gvd_ys, gvd_xs = np.where(gvd_mask)
+        gvd_set = set(zip(gvd_xs.tolist(), gvd_ys.tolist()))
+
+        for x, y in gvd_set:
+            wx = x * resolution + ox
+            wy = y * resolution + oy
+            p1 = Point(x=wx, y=wy, z=0.05)
+            # Check right neighbor
+            if (x + 1, y) in gvd_set:
+                p2 = Point(x=(x + 1) * resolution + ox, y=wy, z=0.05)
+                line_marker.points.append(p1)
+                line_marker.points.append(p2)
+            # Check down neighbor
+            if (x, y + 1) in gvd_set:
+                p2 = Point(x=wx, y=(y + 1) * resolution + oy, z=0.05)
+                line_marker.points.append(p1)
+                line_marker.points.append(p2)
+            # Check diagonal right-down
+            if (x + 1, y + 1) in gvd_set:
+                p2 = Point(x=(x + 1) * resolution + ox,
+                           y=(y + 1) * resolution + oy, z=0.05)
+                line_marker.points.append(p1)
+                line_marker.points.append(p2)
+            # Check diagonal right-up
+            if (x + 1, y - 1) in gvd_set:
+                p2 = Point(x=(x + 1) * resolution + ox,
+                           y=(y - 1) * resolution + oy, z=0.05)
+                line_marker.points.append(p1)
+                line_marker.points.append(p2)
+
+        if line_marker.points:
+            ma.markers.append(line_marker)
+
+        self.gvd_marker_pub.publish(ma)
 
     def _publish_markers(self, frontiers, chosen):
         """Publish frontier centroids as RViz markers."""

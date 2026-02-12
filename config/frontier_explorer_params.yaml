@@ -53,3 +53,16 @@ frontier_explorer:
 
     # Publish MarkerArray of frontier centroids to /frontier_markers
     visualize: true
+
+    # --- GVD (Voronoi Skeleton) ---
+    # Minimum distance-to-obstacle in cells for a GVD point to be valid.
+    # Filters out skeleton branches too close to walls.
+    gvd_min_clearance: 3
+
+    # Maximum search radius (metres) when snapping a frontier goal to the
+    # nearest GVD point.  If no GVD point is found within this radius,
+    # the original frontier centroid is used.
+    gvd_snap_radius: 2.0
+
+    # Publish GVD skeleton as LINE_LIST markers on /explore/gvd
+    visualize_gvd: true
