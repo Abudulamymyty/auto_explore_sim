@@ -1,20 +1,21 @@
 # =============================================================================
 # Frontier Explorer Parameters
 # =============================================================================
-# Custom frontier-based autonomous explorer (replaces explore_lite).
-# Subscribes to /map, detects frontier cells, clusters them, and sends
-# NavigateToPose goals to Nav2.
+# BFS frontier-based autonomous explorer inspired by m-explore.
+# Searches outward from robot position, picks nearest frontier with GVD
+# clearance tiebreaking (prefers frontiers in wider corridors).
 #
-# Based on: https://github.com/AniArka/Autonomous-Explorer-and-Mapper-ros2-nav2
+# cost = min_distance - clearance_scale * clearance_at_centroid
+#
+# Control:  publish Bool to 'explore/resume' to stop (false) / resume (true)
 # =============================================================================
 
 frontier_explorer:
   ros__parameters:
-    # How often the explore loop runs (Hz).
-    # 0.2 = every 5 seconds. The node only sends a new goal when the
-    # previous one finishes or times out, so this mainly controls how
-    # quickly it reacts after a goal completes.
-    explore_frequency: 0.2
+    # How often the planner runs (Hz).
+    # The node also replans immediately on goal completion, so this mainly
+    # controls how quickly it reacts when idle.
+    planner_frequency: 0.5
 
     # TF frames
     robot_base_frame: base_link
@@ -27,21 +28,12 @@ frontier_explorer:
     # a valid frontier. Filters noise / tiny gaps.
     min_frontier_size: 5
 
-    # --- Frontier scoring: cost = potential_scale * dist - gain_scale * size ---
-    # Both distance and size are in metres (size = cell_count * resolution).
-    # Higher potential_scale → prefer closer frontiers (less travel).
-    potential_scale: 3.0
-    # Higher gain_scale → prefer larger frontiers (more unknown area).
-    gain_scale: 1.0
-
-    # Skip any frontier centroid closer than this to the robot (m).
-    # Must be >= Nav2's xy_goal_tolerance (0.5 m by default) or Nav2
-    # will instantly declare "goal reached" without moving.
-    min_goal_distance: 0.6
-
-    # Don't switch to a new frontier if it is within this distance (m)
-    # of the current goal. Prevents jitter from SLAM map updates.
-    goal_distance_hysteresis: 1.0
+    # --- GVD clearance tiebreaker ---
+    # Among roughly equidistant frontiers, prefer those in wider corridors.
+    # A frontier with 1m more clearance gets a (clearance_scale * 1) m
+    # discount on its effective distance.
+    # Set to 0.0 to disable (pure nearest-first).
+    clearance_scale: 0.2
 
     # If no movement > 0.3 m within this many seconds, cancel goal
     # and blacklist the frontier.
@@ -54,6 +46,10 @@ frontier_explorer:
     # Radius around a blacklisted point (m). Any frontier centroid
     # within this radius is also considered blacklisted.
     blacklist_radius: 0.5
+
+    # When true, the robot navigates back to its starting pose after
+    # all frontiers are exhausted.
+    return_to_init: false
 
     # Publish MarkerArray of frontier centroids to /frontier_markers
     visualize: true

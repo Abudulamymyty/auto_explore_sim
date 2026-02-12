@@ -247,7 +247,7 @@ global_costmap:
       robot_radius: 0.15
       resolution: 0.05
       track_unknown_space: true             # Mark unseen areas as unknown (for exploration)
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "voronoi_layer"]
 
       # Subscribes to SLAM-generated map
       static_layer:
@@ -277,10 +277,21 @@ global_costmap:
         # Gentle decay so planner gets a smooth cost gradient.
         # Lower scaling = cost drops off more slowly from obstacles
         # → planner clearly "sees" walls from far away and routes around them
-        cost_scaling_factor: 3.0
+        cost_scaling_factor: 4.0
         # 0.40m > robot_radius (0.22m) → guaranteed gradient zone around all obstacles.
         # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
-        inflation_radius: 0.30
+        inflation_radius: 0.20
+
+      # GVD-based corridor preference layer.
+      # Adds cost near walls so the planner prefers routes through corridor
+      # centers (medial axis / Voronoi diagram).
+      # Must come AFTER inflation_layer in the plugins list.
+      voronoi_layer:
+        plugin: "nav2_voronoi_layer::VoronoiLayer"
+        enabled: true
+        max_cost: 120.0           # Extra cost at min_clearance distance (0-252)
+        decay_factor: 3.0        # Exponential decay rate toward corridor center
+        min_clearance: 0.22      # Don't add cost within inscribed radius (m)
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
