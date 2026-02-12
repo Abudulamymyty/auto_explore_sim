@@ -8,4 +8,10 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install Python explorer script
+install(PROGRAMS
+  scripts/frontier_explorer.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

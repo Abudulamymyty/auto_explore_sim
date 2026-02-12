@@ -54,7 +54,7 @@ def generate_launch_description():
     world_file = os.path.join(pkg_dir, 'worlds', 'office.sdf')
     nav2_params_file = os.path.join(pkg_dir, 'config', 'nav2_params.yaml')
     slam_params_file = os.path.join(pkg_dir, 'config', 'slam_toolbox_params.yaml')
-    explore_params_file = os.path.join(pkg_dir, 'config', 'explore_params.yaml')
+    explore_params_file = os.path.join(pkg_dir, 'config', 'frontier_explorer_params.yaml')
     rviz_config_file = os.path.join(pkg_dir, 'rviz', 'explore.rviz')
 
     # Nav2 params with substitutions
@@ -217,14 +217,14 @@ def generate_launch_description():
         ],
     )
 
-    # ===== 7. explore_lite (delayed to let Nav2 + SLAM start first) =====
-    explore_lite = TimerAction(
+    # ===== 7. Frontier Explorer (delayed to let Nav2 + SLAM start first) =====
+    frontier_explorer = TimerAction(
         period=15.0,
         actions=[
             Node(
-                package='explore_lite',
-                executable='explore',
-                name='explore_node',
+                package='auto_explore_sim',
+                executable='frontier_explorer.py',
+                name='frontier_explorer',
                 output='screen',
                 parameters=[explore_params_file, {'use_sim_time': use_sim_time}],
             ),
@@ -267,7 +267,7 @@ def generate_launch_description():
     ld.add_action(nav2_nodes)
 
     # Start exploration (delayed)
-    ld.add_action(explore_lite)
+    ld.add_action(frontier_explorer)
 
     # Start visualization
     ld.add_action(rviz_node)
