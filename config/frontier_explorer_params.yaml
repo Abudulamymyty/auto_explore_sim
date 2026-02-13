@@ -26,7 +26,7 @@ frontier_explorer:
 
     # Minimum number of frontier cells in a cluster to be considered
     # a valid frontier. Filters noise / tiny gaps.
-    min_frontier_size: 5
+    min_frontier_size: 20
 
     # --- GVD clearance tiebreaker ---
     # Among roughly equidistant frontiers, prefer those in wider corridors.
@@ -57,7 +57,7 @@ frontier_explorer:
     # --- GVD (Voronoi Skeleton) ---
     # Minimum distance-to-obstacle in cells for a GVD point to be valid.
     # Filters out skeleton branches too close to walls.
-    gvd_min_clearance: 3
+    gvd_min_clearance: 5
 
     # Maximum search radius (metres) when snapping a frontier goal to the
     # nearest GVD point.  If no GVD point is found within this radius,

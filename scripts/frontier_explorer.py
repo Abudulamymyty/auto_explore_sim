@@ -16,6 +16,7 @@ Key features:
   - RViz frontier marker visualisation
 """
 
+import heapq
 import math
 from collections import deque
 
@@ -29,7 +30,7 @@ from rclpy.duration import Duration
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import Bool
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -116,6 +117,9 @@ class FrontierExplorerNode(Node):
         self.nav_client = ActionClient(
             self, NavigateToPose, 'navigate_to_pose',
             callback_group=self._action_cb_group)
+        self.nav_through_client = ActionClient(
+            self, NavigateThroughPoses, 'navigate_through_poses',
+            callback_group=self._action_cb_group)
 
         # ── Visualisation publisher ─────────────────────────────────────
         if self.visualize:
@@ -124,6 +128,8 @@ class FrontierExplorerNode(Node):
         if self.visualize_gvd:
             self.gvd_marker_pub = self.create_publisher(
                 MarkerArray, 'explore/gvd', 10)
+        self.path_marker_pub = self.create_publisher(
+            MarkerArray, 'explore/gvd_path', 10)
 
         # ── State ───────────────────────────────────────────────────────
         self.navigating = False
@@ -246,10 +252,25 @@ class FrontierExplorerNode(Node):
         if self.visualize_gvd:
             self._publish_gvd_markers(map_array, info)
 
-        # 7. Snap frontier goal to nearest GVD point
-        gx, gy = self._snap_to_gvd(best.centroid, robot_xy, map_array, info)
+        # 7. Try to find a path along the GVD skeleton
+        gvd_path = self._find_gvd_path(
+            robot_xy, best.centroid, map_array, info)
 
-        # 8. Skip if goal is too close to robot (would cause instant-success loop)
+        if gvd_path and len(gvd_path) >= 2:
+            # GVD path found — sample waypoints and navigate through them
+            waypoints = self._sample_waypoints(gvd_path, spacing=0.5)
+            gx, gy = waypoints[-1]
+            self.get_logger().info(
+                f'GVD path found: {len(gvd_path)} cells → '
+                f'{len(waypoints)} waypoints')
+        else:
+            # Fallback: snap frontier goal to nearest GVD point
+            gx, gy = self._snap_to_gvd(
+                best.centroid, robot_xy, map_array, info)
+            waypoints = None
+            self.get_logger().info('No GVD path — using single goal fallback')
+
+        # 8. Skip if goal is too close to robot (instant-success loop)
         dist_to_goal = math.hypot(gx - robot_xy[0], gy - robot_xy[1])
         if dist_to_goal < 0.3:
             self.get_logger().warning(
@@ -268,7 +289,11 @@ class FrontierExplorerNode(Node):
 
         # 10. Navigate
         self.current_frontier = best.centroid
-        self._navigate_to(gx, gy)
+        if waypoints and len(waypoints) >= 2:
+            self._publish_path_markers(waypoints)
+            self._navigate_through_poses(waypoints)
+        else:
+            self._navigate_to(gx, gy)
 
     # ================================================================
     # BFS frontier search from robot position
@@ -674,6 +699,159 @@ class FrontierExplorerNode(Node):
         return point
 
     # ================================================================
+    # GVD path planning (A* on skeleton)
+    # ================================================================
+
+    def _nearest_gvd_cell(self, wx, wy, map_array, info, max_radius_m=1.5):
+        """Find nearest GVD cell to a world-coordinate point via BFS."""
+        gvd_mask = self._get_gvd_mask(map_array)
+        if gvd_mask is None:
+            return None
+        resolution = info.resolution
+        ox, oy = info.origin.position.x, info.origin.position.y
+        w, h = info.width, info.height
+        px = max(0, min(w - 1, int((wx - ox) / resolution)))
+        py = max(0, min(h - 1, int((wy - oy) / resolution)))
+        if gvd_mask[py, px]:
+            return (px, py)
+        max_cells = int(max_radius_m / resolution)
+        visited = set()
+        queue = deque()
+        queue.append((px, py))
+        visited.add((px, py))
+        while queue:
+            cx, cy = queue.popleft()
+            if gvd_mask[cy, cx]:
+                return (cx, cy)
+            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + ddx, cy + ddy
+                if (0 <= nx < w and 0 <= ny < h
+                        and (nx, ny) not in visited
+                        and abs(nx - px) <= max_cells
+                        and abs(ny - py) <= max_cells):
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+        return None
+
+    def _find_gvd_path(self, robot_xy, goal_xy, map_array, info):
+        """
+        A* search from robot to goal, strongly preferring GVD skeleton cells.
+        Non-GVD free cells are traversable but with a heavy penalty, so the
+        path sticks to the skeleton but can bridge gaps where needed.
+        Returns list of (wx, wy) world-coordinate waypoints, or None.
+        """
+        gvd_mask = self._get_gvd_mask(map_array)
+        if gvd_mask is None:
+            return None
+
+        # Find nearest GVD cells to robot and goal
+        start = self._nearest_gvd_cell(
+            robot_xy[0], robot_xy[1], map_array, info)
+        end = self._nearest_gvd_cell(
+            goal_xy[0], goal_xy[1], map_array, info)
+        if start is None or end is None:
+            self.get_logger().info(
+                f'GVD path: no GVD cell near '
+                f'{"robot" if start is None else "goal"}')
+            return None
+        if start == end:
+            return None
+
+        resolution = info.resolution
+        ox, oy = info.origin.position.x, info.origin.position.y
+        w, h = info.width, info.height
+
+        # A* on free cells (8-connected), GVD cells preferred
+        # GVD cell cost = 1.0, non-GVD free cell cost = 5.0 (penalty)
+        SQRT2 = math.sqrt(2)
+        OFF_GVD_PENALTY = 5.0
+        counter = 0
+        open_set = []
+        heapq.heappush(open_set, (0.0, counter, start))
+        came_from = {}
+        g_score = {start: 0.0}
+
+        ex, ey = end
+
+        while open_set:
+            _, _, current = heapq.heappop(open_set)
+            cx, cy = current
+
+            if current == end:
+                # Reconstruct path
+                path = []
+                node = end
+                while node in came_from:
+                    path.append(node)
+                    node = came_from[node]
+                path.append(start)
+                path.reverse()
+                # Convert to world coordinates
+                world_path = [(x * resolution + ox, y * resolution + oy)
+                              for x, y in path]
+                gvd_count = sum(1 for x, y in path if gvd_mask[y, x])
+                self.get_logger().info(
+                    f'GVD path: {len(path)} cells, '
+                    f'{gvd_count} on skeleton '
+                    f'({100*gvd_count//len(path)}%)')
+                return world_path
+
+            for ddx, ddy in ((-1, -1), (-1, 0), (-1, 1),
+                             (0, -1),           (0, 1),
+                             (1, -1),  (1, 0),  (1, 1)):
+                nx, ny = cx + ddx, cy + ddy
+                if not (0 <= nx < w and 0 <= ny < h):
+                    continue
+                # Must be free cell (occupancy == 0)
+                if map_array[ny, nx] != 0:
+                    continue
+
+                diag = 1 if (ddx != 0 and ddy != 0) else 0
+                base_cost = SQRT2 if diag else 1.0
+                # Heavy penalty for leaving the skeleton
+                if not gvd_mask[ny, nx]:
+                    base_cost *= OFF_GVD_PENALTY
+                tentative_g = g_score[current] + base_cost
+                neighbor = (nx, ny)
+
+                if tentative_g < g_score.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    heur = math.hypot(nx - ex, ny - ey)
+                    counter += 1
+                    heapq.heappush(open_set,
+                                   (tentative_g + heur, counter, neighbor))
+
+        self.get_logger().info(
+            f'GVD path: A* failed (explored {len(g_score)} cells)')
+        return None
+
+    def _sample_waypoints(self, path, spacing=0.5):
+        """
+        Down-sample a dense path to waypoints spaced ~spacing metres apart.
+        Always includes the first and last point.
+        """
+        if len(path) <= 2:
+            return list(path)
+
+        sampled = [path[0]]
+        accum = 0.0
+
+        for i in range(1, len(path)):
+            dx = path[i][0] - path[i - 1][0]
+            dy = path[i][1] - path[i - 1][1]
+            accum += math.hypot(dx, dy)
+            if accum >= spacing:
+                sampled.append(path[i])
+                accum = 0.0
+
+        # Always include the last point
+        if sampled[-1] != path[-1]:
+            sampled.append(path[-1])
+
+        return sampled
+
+    # ================================================================
     # Navigation
     # ================================================================
 
@@ -703,6 +881,44 @@ class FrontierExplorerNode(Node):
 
         self.current_goal = (x, y)
         self.prev_goal = (x, y)
+        self.navigating = True
+        self.last_progress_time = self.get_clock().now()
+        self.last_robot_pos = self._get_robot_position()
+
+    def _navigate_through_poses(self, waypoints):
+        """Send a NavigateThroughPoses goal with GVD waypoints."""
+        if not self.nav_through_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error(
+                'NavigateThroughPoses action server not available!')
+            return
+
+        stamp = self.get_clock().now().to_msg()
+        poses = []
+        for wx, wy in waypoints:
+            p = PoseStamped()
+            p.header.frame_id = self.global_frame
+            p.header.stamp = stamp
+            p.pose.position.x = wx
+            p.pose.position.y = wy
+            p.pose.orientation.w = 1.0
+            poses.append(p)
+
+        nav_goal = NavigateThroughPoses.Goal()
+        nav_goal.poses = poses
+
+        self._goal_seq += 1
+        seq = self._goal_seq
+        last = waypoints[-1]
+        self.get_logger().info(
+            f'Navigating through {len(waypoints)} GVD waypoints '
+            f'→ ({last[0]:.2f}, {last[1]:.2f})')
+
+        send_future = self.nav_through_client.send_goal_async(nav_goal)
+        send_future.add_done_callback(
+            lambda f, s=seq: self._goal_response_cb(f, s))
+
+        self.current_goal = last
+        self.prev_goal = last
         self.navigating = True
         self.last_progress_time = self.get_clock().now()
         self.last_robot_pos = self._get_robot_position()
@@ -852,6 +1068,60 @@ class FrontierExplorerNode(Node):
     # ================================================================
     # Visualisation
     # ================================================================
+
+    def _publish_path_markers(self, waypoints):
+        """Publish the current GVD navigation path as a LINE_STRIP."""
+        ma = MarkerArray()
+
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        delete_marker.ns = 'gvd_path'
+        ma.markers.append(delete_marker)
+
+        if len(waypoints) >= 2:
+            m = Marker()
+            m.header.frame_id = self.global_frame
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = 'gvd_path'
+            m.id = 1
+            m.type = Marker.LINE_STRIP
+            m.action = Marker.ADD
+            m.scale.x = 0.05  # line width
+            m.color.r = 1.0
+            m.color.g = 0.0
+            m.color.b = 1.0
+            m.color.a = 1.0
+            m.lifetime.sec = 30
+            m.pose.orientation.w = 1.0
+
+            for wx, wy in waypoints:
+                m.points.append(Point(x=wx, y=wy, z=0.08))
+            ma.markers.append(m)
+
+            # Add sphere markers at each waypoint
+            for i, (wx, wy) in enumerate(waypoints):
+                s = Marker()
+                s.header.frame_id = self.global_frame
+                s.header.stamp = m.header.stamp
+                s.ns = 'gvd_path'
+                s.id = i + 10
+                s.type = Marker.SPHERE
+                s.action = Marker.ADD
+                s.pose.position.x = wx
+                s.pose.position.y = wy
+                s.pose.position.z = 0.08
+                s.pose.orientation.w = 1.0
+                s.scale.x = 0.1
+                s.scale.y = 0.1
+                s.scale.z = 0.1
+                s.color.r = 1.0
+                s.color.g = 0.0
+                s.color.b = 1.0
+                s.color.a = 1.0
+                s.lifetime.sec = 30
+                ma.markers.append(s)
+
+        self.path_marker_pub.publish(ma)
 
     def _publish_gvd_markers(self, map_array, info):
         """Publish GVD skeleton as connected LINE_LIST markers."""

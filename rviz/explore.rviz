@@ -92,6 +92,12 @@ Visualization Manager:
       Topic:
         Value: /explore/gvd
 
+    - Class: rviz_default_plugins/MarkerArray
+      Name: GVD Path
+      Enabled: true
+      Topic:
+        Value: /explore/gvd_path
+
     - Class: rviz_default_plugins/Marker
       Name: Exploration Goal
       Enabled: true
