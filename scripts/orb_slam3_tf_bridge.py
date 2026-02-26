@@ -2,174 +2,227 @@
 """
 orb_slam3_tf_bridge.py
 ======================
-Bridges ORB-SLAM3 camera pose output into the Nav2-compatible TF chain.
+Converts ORB-SLAM3 camera pose to the Nav2-compatible map→odom TF.
 
-ORB-SLAM3 (via orb_slam3_ros2_wrapper) publishes the camera pose in the
-*map* frame as a geometry_msgs/PoseStamped on /orb_slam3/pose.  Nav2 expects:
+Coordinate conventions
+----------------------
+ORB-SLAM3 uses **camera optical** convention (OpenCV / COLMAP):
+    X  →  right    Y  ↓  down    Z  →  forward (optical axis)
 
-    map  →  odom  →  base_footprint / base_link  →  sensor frames
+ROS REP-103 convention (what Nav2 / the map frame expects):
+    X  →  forward  Y  ←  left    Z  ↑  up
 
-The diff-drive plugin already publishes odom → base_link.  The robot model
-(robot_state_publisher) provides base_link → camera_link as a static TF.
+Two corrections are therefore applied inside this node:
 
-This node computes and broadcasts:
+  1. ORB-SLAM3 world → ROS map frame rotation  (R_ORB_TO_ROS):
+       columns = ORB-world basis vectors expressed in ROS-map coordinates
+       ORB Z (fwd)   →  ROS X  :  column [1, 0, 0]
+       ORB X (right) →  ROS -Y :  column [0,-1, 0]
+       ORB Y (down)  →  ROS -Z :  column [0, 0,-1]
+       →  R_ORB_TO_ROS = [[0, 0, 1],
+                          [-1, 0, 0],
+                          [0,-1, 0]]
 
-    T(map → odom) = T(map → camera_link) × T(camera_link → base_link)
-                     × inv( T(odom → base_link) )
+  2. Camera optical frame → camera_link (body) frame rotation  (R_OPT_TO_BODY):
+       body X (fwd)   →  optical Z  :  column [0, 0, 1]
+       body Y (left)  →  optical -X :  column [-1, 0, 0]
+       body Z (up)    →  optical -Y :  column [0,-1, 0]
+       →  R_OPT_TO_BODY = [[0,-1, 0],
+                            [0, 0,-1],
+                            [1, 0, 0]]
 
-i.e. it converts ORB-SLAM3's camera-centric pose into the standard SLAM
-odometry correction transform that Nav2 reads.
+The combined transform applied to Twc (camera optical in ORB world):
+
+    T(rosmap → camera_link) = R_ORB_TO_ROS  ×  Twc  ×  R_OPT_TO_BODY
+
+From this, map→odom is computed as:
+
+    T(map→odom) = T(map→camera_link) × T(camera_link→base_link)
+                  × inv(T(odom→base_link))
 
 Subscribed topics
 -----------------
 /orb_slam3/pose   geometry_msgs/PoseStamped
-    Camera pose in the map frame published by orb_slam3_ros2_wrapper.
+    Camera pose in ORB-SLAM3 world (optical convention) from the modified
+    orbslam3 rgbd node.
 
 TF published
 ------------
-map → odom   (at the same rate as the incoming pose messages)
+map → odom   (at the incoming pose rate, ~15 Hz)
 """
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time as RclpyTime
 from rclpy.duration import Duration
 
-import numpy as np
 from geometry_msgs.msg import PoseStamped, TransformStamped
 import tf2_ros
 from tf2_ros import Buffer, TransformListener, TransformBroadcaster
-from tf_transformations import (
-    quaternion_matrix,
-    quaternion_from_matrix,
-    quaternion_inverse,
-    quaternion_multiply,
-)
+from tf_transformations import quaternion_matrix, quaternion_from_matrix
 
 
-def pose_to_matrix(pose):
-    """Convert geometry_msgs/Pose to 4×4 numpy homogeneous transform."""
+# ---------------------------------------------------------------------------
+# Constant coordinate-correction matrices (4×4 homogeneous, rotation-only)
+# ---------------------------------------------------------------------------
+
+# Converts ORB-SLAM3 world frame (Z fwd, X right, Y down)
+# to ROS map frame (X fwd, Y left, Z up).
+# Each column = one ORB-world basis in ROS-map coordinates.
+_R_ORB_TO_ROS = np.array([
+    [0,  0,  1, 0],   # ORB Z → ROS X
+    [-1, 0,  0, 0],   # ORB X → ROS -Y
+    [0, -1,  0, 0],   # ORB Y → ROS -Z
+    [0,  0,  0, 1],
+], dtype=float)
+
+# Converts camera optical frame (Z fwd, X right, Y down)
+# to camera body/link frame (X fwd, Y left, Z up).
+# Each column = one body-frame basis in optical coordinates.
+_R_OPT_TO_BODY = np.array([
+    [0, -1,  0, 0],   # body X → optical Z  (column 0 of inverse)
+    [0,  0, -1, 0],   # body Y → optical -X
+    [1,  0,  0, 0],   # body Z → optical -Y
+    [0,  0,  0, 1],
+], dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _pose_to_matrix(pose):
+    """geometry_msgs/Pose → 4×4 numpy homogeneous transform."""
     q = pose.orientation
-    mat = quaternion_matrix([q.x, q.y, q.z, q.w])
-    mat[0, 3] = pose.position.x
-    mat[1, 3] = pose.position.y
-    mat[2, 3] = pose.position.z
-    return mat
+    m = quaternion_matrix([q.x, q.y, q.z, q.w])
+    m[0, 3] = pose.position.x
+    m[1, 3] = pose.position.y
+    m[2, 3] = pose.position.z
+    return m
 
 
-def matrix_to_transform_stamped(mat, stamp, frame_id, child_frame_id):
-    """Convert 4×4 numpy matrix to a TransformStamped."""
-    t = TransformStamped()
-    t.header.stamp = stamp
-    t.header.frame_id = frame_id
-    t.child_frame_id = child_frame_id
+def _transform_to_matrix(ts: TransformStamped):
+    """TransformStamped → 4×4 numpy homogeneous transform."""
+    t = ts.transform.translation
+    r = ts.transform.rotation
+    m = quaternion_matrix([r.x, r.y, r.z, r.w])
+    m[0, 3] = t.x
+    m[1, 3] = t.y
+    m[2, 3] = t.z
+    return m
 
-    t.transform.translation.x = float(mat[0, 3])
-    t.transform.translation.y = float(mat[1, 3])
-    t.transform.translation.z = float(mat[2, 3])
 
+def _matrix_to_transform_stamped(mat, stamp, frame_id, child_frame_id):
+    """4×4 numpy matrix → TransformStamped."""
+    ts = TransformStamped()
+    ts.header.stamp     = stamp
+    ts.header.frame_id  = frame_id
+    ts.child_frame_id   = child_frame_id
+    ts.transform.translation.x = float(mat[0, 3])
+    ts.transform.translation.y = float(mat[1, 3])
+    ts.transform.translation.z = float(mat[2, 3])
     q = quaternion_from_matrix(mat)
-    t.transform.rotation.x = float(q[0])
-    t.transform.rotation.y = float(q[1])
-    t.transform.rotation.z = float(q[2])
-    t.transform.rotation.w = float(q[3])
-    return t
+    ts.transform.rotation.x = float(q[0])
+    ts.transform.rotation.y = float(q[1])
+    ts.transform.rotation.z = float(q[2])
+    ts.transform.rotation.w = float(q[3])
+    return ts
 
 
-def transform_stamped_to_matrix(ts):
-    """Convert a TransformStamped to a 4×4 numpy homogeneous transform."""
-    tr = ts.transform.translation
-    rot = ts.transform.rotation
-    mat = quaternion_matrix([rot.x, rot.y, rot.z, rot.w])
-    mat[0, 3] = tr.x
-    mat[1, 3] = tr.y
-    mat[2, 3] = tr.z
-    return mat
-
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
 
 class OrbSlam3TfBridge(Node):
-    """Converts ORB-SLAM3 camera pose → map→odom TF broadcast."""
+    """
+    Subscribes to /orb_slam3/pose, applies coordinate corrections, and
+    broadcasts the map→odom TF that Nav2 requires.
+    """
 
     def __init__(self):
         super().__init__('orb_slam3_tf_bridge')
 
-        # --- Parameters ---
-        self.declare_parameter('camera_frame', 'camera_link')
-        self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('odom_frame', 'odom')
-        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('camera_frame',      'camera_link')
+        self.declare_parameter('base_frame',        'base_link')
+        self.declare_parameter('odom_frame',        'odom')
+        self.declare_parameter('map_frame',         'map')
         self.declare_parameter('tf_lookup_timeout', 0.1)
 
-        self.camera_frame = self.get_parameter('camera_frame').value
-        self.base_frame = self.get_parameter('base_frame').value
-        self.odom_frame = self.get_parameter('odom_frame').value
-        self.map_frame = self.get_parameter('map_frame').value
-        self.tf_timeout = Duration(
+        self._cam_frame  = self.get_parameter('camera_frame').value
+        self._base_frame = self.get_parameter('base_frame').value
+        self._odom_frame = self.get_parameter('odom_frame').value
+        self._map_frame  = self.get_parameter('map_frame').value
+        self._tf_timeout = Duration(
             seconds=self.get_parameter('tf_lookup_timeout').value)
 
-        # --- TF infrastructure ---
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = TransformBroadcaster(self)
+        self._tf_buffer   = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._tf_pub      = TransformBroadcaster(self)
 
-        # --- Subscriber ---
-        self.pose_sub = self.create_subscription(
-            PoseStamped,
-            '/orb_slam3/pose',
-            self._pose_callback,
-            10,
-        )
+        self.create_subscription(
+            PoseStamped, '/orb_slam3/pose', self._pose_cb, 10)
 
         self.get_logger().info(
             f'orb_slam3_tf_bridge ready — '
-            f'listening on /orb_slam3/pose, broadcasting {self.map_frame} → {self.odom_frame}'
-        )
+            f'listening /orb_slam3/pose → broadcasting '
+            f'{self._map_frame}→{self._odom_frame}')
 
     # ------------------------------------------------------------------
-    def _pose_callback(self, msg: PoseStamped):
+    def _pose_cb(self, msg: PoseStamped):
         """
-        Receive camera pose (map→camera) and broadcast map→odom.
+        Receive Twc (camera optical in ORB-SLAM3 world) and publish map→odom.
 
-        T(map→odom) = T(map→camera) × T(camera→base) × T(base→odom)
-                    = T(map→camera) × T(camera→base) × inv(T(odom→base))
+        Steps
+        -----
+        1. Apply _R_ORB_TO_ROS × Twc × _R_OPT_TO_BODY
+           → T(rosmap → camera_link)
+        2. Look up T(camera_link → base_link)  [static, from URDF]
+        3. Look up T(odom → base_link)          [from diff-drive odometry]
+        4. T(map→odom) = T(map→cam_link) × T(cam_link→base) × inv(T(odom→base))
         """
         stamp = msg.header.stamp
 
-        # 1. T(map → camera_link) — from ORB-SLAM3 pose message
-        T_map_cam = pose_to_matrix(msg.pose)
+        # ── 1. Twc in ORB-SLAM3 world, then corrected to rosmap/camera_link ──
+        Twc = _pose_to_matrix(msg.pose)
 
-        # 2. T(camera_link → base_link) — static, from robot_state_publisher
+        # Combined: T_rosmap_camlink = R_ORB_TO_ROS × Twc × R_OPT_TO_BODY
+        T_map_cam = _R_ORB_TO_ROS @ Twc @ _R_OPT_TO_BODY
+
+        # ── 2. T(camera_link → base_link) — static from robot_state_publisher ──
         try:
-            ts_cam_base = self.tf_buffer.lookup_transform(
-                self.camera_frame, self.base_frame, RclpyTime(), self.tf_timeout)
+            ts_cam_base = self._tf_buffer.lookup_transform(
+                self._cam_frame, self._base_frame,
+                RclpyTime(), self._tf_timeout)
         except Exception as e:
             self.get_logger().warn(
-                f'Cannot lookup {self.camera_frame}→{self.base_frame}: {e}',
+                f'TF {self._cam_frame}→{self._base_frame} unavailable: {e}',
                 throttle_duration_sec=5.0)
             return
-        T_cam_base = transform_stamped_to_matrix(ts_cam_base)
+        T_cam_base = _transform_to_matrix(ts_cam_base)
 
-        # 3. T(odom → base_link) — from diff-drive odometry TF
+        # ── 3. T(odom → base_link) — from diff-drive odometry ──
         try:
-            ts_odom_base = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame, RclpyTime(), self.tf_timeout)
+            ts_odom_base = self._tf_buffer.lookup_transform(
+                self._odom_frame, self._base_frame,
+                RclpyTime(), self._tf_timeout)
         except Exception as e:
             self.get_logger().warn(
-                f'Cannot lookup {self.odom_frame}→{self.base_frame}: {e}',
+                f'TF {self._odom_frame}→{self._base_frame} unavailable: {e}',
                 throttle_duration_sec=5.0)
             return
-        T_odom_base = transform_stamped_to_matrix(ts_odom_base)
+        T_odom_base = _transform_to_matrix(ts_odom_base)
 
-        # 4. Compose: T(map→odom)
-        #    = T(map→cam) @ T(cam→base) @ inv(T(odom→base))
-        T_base_odom = np.linalg.inv(T_odom_base)   # inv(T(odom→base)) = T(base→odom)
-        T_map_odom = T_map_cam @ T_cam_base @ T_base_odom
+        # ── 4. Compose map→odom ──
+        # T(map→odom) = T(map→cam) × T(cam→base) × T(base→odom)
+        T_map_odom = T_map_cam @ T_cam_base @ np.linalg.inv(T_odom_base)
 
-        # 5. Broadcast
-        ts_out = matrix_to_transform_stamped(
-            T_map_odom, stamp, self.map_frame, self.odom_frame)
-        self.tf_broadcaster.sendTransform(ts_out)
+        ts_out = _matrix_to_transform_stamped(
+            T_map_odom, stamp, self._map_frame, self._odom_frame)
+        self._tf_pub.sendTransform(ts_out)
 
+
+# ---------------------------------------------------------------------------
 
 def main(args=None):
     rclpy.init(args=args)

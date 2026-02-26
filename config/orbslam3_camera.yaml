@@ -24,8 +24,14 @@ Camera.cy: 240.0
 # Distortion coefficients — zero for ideal simulated camera
 Camera.k1: 0.0
 Camera.k2: 0.0
+Camera.k3: 0.0
 Camera.p1: 0.0
 Camera.p2: 0.0
+
+# Stereo baseline × fx (Camera.bf = b * fx).
+# For a pure RGBD camera there is no physical stereo baseline; set to a
+# small positive value so ORB-SLAM3's RGBD mode accepts the config.
+Camera.bf: 40.0
 
 # Image size
 Camera.width:  640

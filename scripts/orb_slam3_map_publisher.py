@@ -2,86 +2,45 @@
 """
 orb_slam3_map_publisher.py
 ==========================
-Converts ORB-SLAM3 3D map points into a 2-D occupancy grid for Nav2.
+LiDAR-based occupancy-grid builder driven by the ORB-SLAM3 TF chain.
 
-ORB-SLAM3 (via orb_slam3_ros2_wrapper) publishes a PointCloud2 of *all* map
-points (in the map frame) on /orb_slam3/all_map_points.  This node:
+ORB-SLAM3 (via orb_slam3_tf_bridge) broadcasts the map→odom TF.  This node
+subscribes to /scan (LaserScan from the G1's LiDAR) and, for every scan,
+looks up the TF that maps the sensor frame into the map frame.  Hit endpoints
+are accumulated in an OccupancyGrid and published on /map for Nav2.
 
-  1. Accumulates those points over time (the SLAM map grows incrementally).
-  2. Filters points by height to select obstacles relevant to ground navigation
-     (e.g. between 0.1 m and 1.8 m above the floor).
-  3. Projects surviving points onto a 2-D grid and marks occupied cells.
-  4. Publishes a nav_msgs/OccupancyGrid on /map at a configurable rate.
+This approach avoids the 3-D→2-D projection ambiguity of projecting ORB-SLAM3
+point clouds and handles the ORB-SLAM3 coordinate-frame conventions cleanly —
+all of that complexity is already resolved inside orb_slam3_tf_bridge.py.
 
-Nav2's static_layer subscribes to /map, so this node acts as the SLAM map
-backend, equivalent to what slam_toolbox produced — but driven by ORB-SLAM3
-instead of LiDAR.
-
-Parameters (all ROS 2 parameters)
-----------------------------------
-map_frame          (str,   default 'map')     : TF frame of the output map.
-map_resolution     (float, default 0.05)      : Cell size in metres.
-map_size           (float, default 40.0)      : Map full-width / height in m.
-publish_rate       (float, default 1.0)       : /map publish frequency (Hz).
-min_height         (float, default 0.10)      : Min obstacle height (m).
-max_height         (float, default 1.80)      : Max obstacle height (m).
-inflation_cells    (int,   default 1)         : Extra cells to inflate occupied.
+Parameters (ROS 2 parameters)
+------------------------------
+map_frame       (str,   default 'map')     : TF frame of the output map.
+scan_topic      (str,   default '/scan')   : LaserScan topic to subscribe to.
+map_resolution  (float, default 0.05)     : Cell size in metres.
+map_size        (float, default 40.0)     : Map full-width / height in m.
+publish_rate    (float, default 1.0)      : /map publish frequency (Hz).
 
 Subscribed topics
 -----------------
-/orb_slam3/all_map_points   sensor_msgs/PointCloud2
+/scan   sensor_msgs/LaserScan
 
 Published topics
 ----------------
-/map   nav_msgs/OccupancyGrid
+/map    nav_msgs/OccupancyGrid
 """
 
 import math
-import struct
-import time
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time as RclpyTime
-from sensor_msgs.msg import PointCloud2
-from nav_msgs.msg import OccupancyGrid, MapMetaData
-from builtin_interfaces.msg import Time as TimeMsg
+from rclpy.duration import Duration
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _pointcloud2_to_xyz(msg: PointCloud2) -> np.ndarray:
-    """Extract (N, 3) float32 array of XYZ from a PointCloud2 message."""
-    # Locate x, y, z field offsets
-    offsets = {}
-    for field in msg.fields:
-        if field.name in ('x', 'y', 'z'):
-            offsets[field.name] = field.offset
-
-    if not {'x', 'y', 'z'} <= offsets.keys():
-        return np.empty((0, 3), dtype=np.float32)
-
-    point_step = msg.point_step
-    data = msg.data
-    n_points = msg.width * msg.height
-
-    xyz = np.empty((n_points, 3), dtype=np.float32)
-    ox = offsets['x']
-    oy = offsets['y']
-    oz = offsets['z']
-
-    for i in range(n_points):
-        base = i * point_step
-        xyz[i, 0] = struct.unpack_from('<f', data, base + ox)[0]
-        xyz[i, 1] = struct.unpack_from('<f', data, base + oy)[0]
-        xyz[i, 2] = struct.unpack_from('<f', data, base + oz)[0]
-
-    # Filter NaN/Inf
-    valid = np.isfinite(xyz).all(axis=1)
-    return xyz[valid]
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
+from tf2_ros import Buffer, TransformListener
 
 
 # ---------------------------------------------------------------------------
@@ -94,110 +53,159 @@ class OrbSlam3MapPublisher(Node):
         super().__init__('orb_slam3_map_publisher')
 
         # --- Parameters ---
-        self.declare_parameter('map_frame',       'map')
-        self.declare_parameter('map_resolution',  0.05)
-        self.declare_parameter('map_size',        40.0)
-        self.declare_parameter('publish_rate',    1.0)
-        self.declare_parameter('min_height',      0.10)
-        self.declare_parameter('max_height',      1.80)
-        self.declare_parameter('inflation_cells', 1)
+        self.declare_parameter('map_frame',      'map')
+        self.declare_parameter('scan_topic',     '/scan')
+        self.declare_parameter('map_resolution', 0.05)
+        self.declare_parameter('map_size',       40.0)
+        self.declare_parameter('publish_rate',   1.0)
 
-        self.map_frame      = self.get_parameter('map_frame').value
-        self.resolution     = self.get_parameter('map_resolution').value
-        self.map_size       = self.get_parameter('map_size').value
-        self.min_h          = self.get_parameter('min_height').value
-        self.max_h          = self.get_parameter('max_height').value
-        self.inflate        = self.get_parameter('inflation_cells').value
+        self._map_frame  = self.get_parameter('map_frame').value
+        self._scan_topic = self.get_parameter('scan_topic').value
+        self._resolution = self.get_parameter('map_resolution').value
+        self._map_size   = self.get_parameter('map_size').value
 
-        # Derived grid dimensions
-        self.n_cells = int(math.ceil(self.map_size / self.resolution))
-        # origin: centre of the grid at (0, 0) in map frame
-        self.origin_x = -(self.map_size / 2.0)
-        self.origin_y = -(self.map_size / 2.0)
+        # Grid dimensions
+        self._n = int(math.ceil(self._map_size / self._resolution))
+        self._origin_x = -(self._map_size / 2.0)
+        self._origin_y = -(self._map_size / 2.0)
 
-        # Accumulated occupancy grid: -1=unknown, 0=free, 100=occupied
-        self._grid = np.full((self.n_cells, self.n_cells), -1, dtype=np.int8)
+        # Accumulated log-odds grid (float32 for numerical stability)
+        # 0 = unknown, positive = occupied, negative = free
+        self._log_odds = np.zeros((self._n, self._n), dtype=np.float32)
+
+        self._L_OCC  =  0.85   # log-odds increment for occupied
+        self._L_FREE = -0.40   # log-odds increment for free ray
+
+        # --- TF ---
+        self._tf_buffer   = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._tf_timeout  = Duration(seconds=0.1)
 
         # --- Publisher ---
-        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 10)
+        self._map_pub = self.create_publisher(OccupancyGrid, '/map', 10)
 
         # --- Subscriber ---
-        self.create_subscription(
-            PointCloud2,
-            '/orb_slam3/all_map_points',
-            self._map_points_callback,
-            rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value,
-        )
+        self.create_subscription(LaserScan, self._scan_topic,
+                                 self._scan_cb, 10)
 
         # --- Publish timer ---
-        period = 1.0 / self.get_parameter('publish_rate').value
-        self.create_timer(period, self._publish_map)
+        rate = self.get_parameter('publish_rate').value
+        self.create_timer(1.0 / rate, self._publish_map)
 
         self.get_logger().info(
             f'orb_slam3_map_publisher ready — '
-            f'{self.n_cells}×{self.n_cells} cells @ {self.resolution} m/cell, '
-            f'publishing /map at {1.0/period:.1f} Hz'
-        )
+            f'{self._n}×{self._n} cells @ {self._resolution} m, '
+            f'scan: {self._scan_topic}, '
+            f'publishing /map at {rate:.1f} Hz')
 
     # ------------------------------------------------------------------
-    def _map_points_callback(self, msg: PointCloud2):
-        """Accumulate new map points into the grid."""
-        if msg.width * msg.height == 0:
+    def _scan_cb(self, msg: LaserScan):
+        """Transform scan hit-points into map frame and accumulate."""
+        # Look up transform: map ← scan frame
+        scan_frame = msg.header.frame_id
+        stamp      = msg.header.stamp
+        try:
+            ts = self._tf_buffer.lookup_transform(
+                self._map_frame, scan_frame,
+                RclpyTime.from_msg(stamp), self._tf_timeout)
+        except Exception:
+            # TF not yet available (ORB-SLAM3 still initialising)
             return
 
-        xyz = _pointcloud2_to_xyz(msg)
-        if xyz.shape[0] == 0:
+        # Sensor origin in map frame
+        tx = ts.transform.translation.x
+        ty = ts.transform.translation.y
+        r  = ts.transform.rotation
+        yaw = math.atan2(
+            2.0 * (r.w * r.z + r.x * r.y),
+            1.0 - 2.0 * (r.y * r.y + r.z * r.z))
+
+        # Compute hit-point angles and ranges
+        n      = len(msg.ranges)
+        angles = np.array([msg.angle_min + i * msg.angle_increment
+                           for i in range(n)], dtype=np.float64)
+        ranges = np.array(msg.ranges, dtype=np.float64)
+
+        # Valid hits: finite, within [range_min, range_max]
+        valid = (np.isfinite(ranges) &
+                 (ranges >= msg.range_min) &
+                 (ranges <= msg.range_max))
+
+        if not valid.any():
             return
 
-        # Height filter
-        mask = (xyz[:, 2] >= self.min_h) & (xyz[:, 2] <= self.max_h)
-        xyz = xyz[mask]
-        if xyz.shape[0] == 0:
-            return
+        # Hit endpoints in map frame
+        global_angles = angles[valid] + yaw
+        hx = tx + ranges[valid] * np.cos(global_angles)
+        hy = ty + ranges[valid] * np.sin(global_angles)
 
-        # World → grid index
-        ix = ((xyz[:, 0] - self.origin_x) / self.resolution).astype(int)
-        iy = ((xyz[:, 1] - self.origin_y) / self.resolution).astype(int)
+        # Grid indices for hits
+        gx = ((hx - self._origin_x) / self._resolution).astype(int)
+        gy = ((hy - self._origin_y) / self._resolution).astype(int)
+        in_b = (gx >= 0) & (gx < self._n) & (gy >= 0) & (gy < self._n)
+        gx, gy = gx[in_b], gy[in_b]
 
-        # Clamp to grid bounds
-        in_bounds = (ix >= 0) & (ix < self.n_cells) & \
-                    (iy >= 0) & (iy < self.n_cells)
-        ix = ix[in_bounds]
-        iy = iy[in_bounds]
+        # Mark hits as occupied
+        self._log_odds[gy, gx] += self._L_OCC
 
-        # Mark occupied
-        self._grid[iy, ix] = 100
+        # Ray-cast free cells (Bresenham) for a subset to keep CPU load low
+        ox = int((tx - self._origin_x) / self._resolution)
+        oy = int((ty - self._origin_y) / self._resolution)
+        if 0 <= ox < self._n and 0 <= oy < self._n:
+            step = max(1, len(gx) // 50)   # at most ~50 rays per scan
+            for i in range(0, len(gx), step):
+                self._bresenham_free(ox, oy, gx[i], gy[i])
 
-        # Simple inflation
-        if self.inflate > 0:
-            for di in range(-self.inflate, self.inflate + 1):
-                for dj in range(-self.inflate, self.inflate + 1):
-                    ni = np.clip(iy + di, 0, self.n_cells - 1)
-                    nj = np.clip(ix + dj, 0, self.n_cells - 1)
-                    self._grid[ni, nj] = np.maximum(self._grid[ni, nj], 50)
+        # Clamp log-odds to avoid saturation
+        np.clip(self._log_odds, -10.0, 10.0, out=self._log_odds)
+
+    # ------------------------------------------------------------------
+    def _bresenham_free(self, x0, y0, x1, y1):
+        """Mark cells along a ray as free (stopping one cell before the hit)."""
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        n = self._n
+        while True:
+            if x0 == x1 and y0 == y1:
+                break
+            if not (0 <= x0 < n and 0 <= y0 < n):
+                break
+            self._log_odds[y0, x0] += self._L_FREE
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
 
     # ------------------------------------------------------------------
     def _publish_map(self):
-        """Publish the accumulated occupancy grid."""
+        """Convert log-odds grid to OccupancyGrid and publish."""
         now = self.get_clock().now().to_msg()
 
-        msg = OccupancyGrid()
-        msg.header.stamp = now
-        msg.header.frame_id = self.map_frame
+        # Convert log-odds to {-1, 0, 100}
+        grid = np.full((self._n, self._n), -1, dtype=np.int8)
+        grid[self._log_odds > 0.0]  = 100
+        grid[self._log_odds < 0.0]  = 0
 
-        msg.info.resolution     = self.resolution
-        msg.info.width          = self.n_cells
-        msg.info.height         = self.n_cells
-        msg.info.map_load_time  = now
-        msg.info.origin.position.x = self.origin_x
-        msg.info.origin.position.y = self.origin_y
+        msg = OccupancyGrid()
+        msg.header.stamp    = now
+        msg.header.frame_id = self._map_frame
+        msg.info.resolution = self._resolution
+        msg.info.width      = self._n
+        msg.info.height     = self._n
+        msg.info.map_load_time = now
+        msg.info.origin.position.x = self._origin_x
+        msg.info.origin.position.y = self._origin_y
         msg.info.origin.position.z = 0.0
         msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten().tolist()
 
-        # Row-major, C order: data[row * width + col] = grid[row, col]
-        msg.data = self._grid.flatten().tolist()
-
-        self.map_pub.publish(msg)
+        self._map_pub.publish(msg)
 
 
 # ---------------------------------------------------------------------------
