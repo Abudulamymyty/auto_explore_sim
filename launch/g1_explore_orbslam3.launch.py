@@ -11,8 +11,7 @@ RGBD camera.  Explorer and Nav2 stack are unchanged from g1_explore.launch.py.
 Data-flow
 ---------
   Gazebo rgbd_camera  →  /camera/{image, depth_image, camera_info}
-    relay nodes       →  /camera/rgb   /camera/depth
-                                 │
+                                 │  (remapped via --ros-args inside ExecuteProcess)
                         ros2 run orbslam3 rgbd <vocab> <cfg>   (positional args)
                           publishes /orb_slam3/pose (PoseStamped, camera in ORB world)
                                  │
@@ -191,38 +190,23 @@ def generate_launch_description():
     )
 
     # =========================================================================
-    # 6a. Camera topic relay
-    #     The Gazebo bridge publishes at /camera/image and /camera/depth_image.
-    #     The orbslam3 rgbd node subscribes to relative topics camera/rgb and
-    #     camera/depth (which resolve to /camera/rgb and /camera/depth).
-    # =========================================================================
-    relay_rgb = Node(
-        package='topic_tools',
-        executable='relay',
-        name='relay_rgb',
-        arguments=['/camera/image', '/camera/rgb'],
-        output='screen',
-    )
-
-    relay_depth = Node(
-        package='topic_tools',
-        executable='relay',
-        name='relay_depth',
-        arguments=['/camera/depth_image', '/camera/depth'],
-        output='screen',
-    )
-
-    # =========================================================================
-    # 6b. ORB-SLAM3 RGBD
+    # 6a/b. ORB-SLAM3 RGBD
     #     Package:    orbslam3   (ros2 run orbslam3 rgbd)
     #     Args:       <vocabulary>  <camera_settings_yaml>   (positional)
-    #     Subscribes: camera/rgb   camera/depth
+    #     Subscribes: camera/rgb   camera/depth  (relative topics)
     #     Publishes:  /orb_slam3/pose  (PoseStamped — camera in ORB world)
     #
-    #     NOTE: vocabulary and settings are positional CLI args, not ROS params.
+    #     The Gazebo bridge publishes /camera/image and /camera/depth_image.
+    #     We remap camera/rgb → /camera/image and camera/depth → /camera/depth_image
+    #     via --ros-args so that topic_tools is not required.
     # =========================================================================
     orb_slam3 = ExecuteProcess(
-        cmd=['ros2', 'run', 'orbslam3', 'rgbd', orb_vocab, orbslam3_cam_file],
+        cmd=[
+            'ros2', 'run', 'orbslam3', 'rgbd', orb_vocab, orbslam3_cam_file,
+            '--ros-args',
+            '-r', 'camera/rgb:=/camera/image',
+            '-r', 'camera/depth:=/camera/depth_image',
+        ],
         output='screen',
     )
 
@@ -348,9 +332,6 @@ def generate_launch_description():
     ld.add_action(spawn_robot)
     ld.add_action(gz_bridge)
     ld.add_action(robot_state_publisher)
-
-    ld.add_action(relay_rgb)
-    ld.add_action(relay_depth)
 
     ld.add_action(orb_slam3)
     ld.add_action(orb_slam3_tf_bridge)
