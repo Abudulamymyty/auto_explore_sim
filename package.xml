@@ -3,7 +3,7 @@
 <package format="3">
   <name>auto_explore_sim</name>
   <version>0.1.0</version>
-  <description>Autonomous exploration simulation with SLAM Toolbox + explore_lite + Nav2</description>
+  <description>Autonomous exploration simulation with Nav2 + Frontier Explorer. Supports slam_toolbox (LiDAR) and ORB-SLAM3 (visual RGBD) backends.</description>
   <maintainer email="user@example.com">user</maintainer>
   <license>Apache-2.0</license>
 
@@ -11,15 +11,28 @@
 
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_minimal_tb3_sim</exec_depend>
+  <!-- LiDAR SLAM backend (used by auto_explore.launch.py and g1_explore.launch.py) -->
   <exec_depend>slam_toolbox</exec_depend>
+
+  <!-- Common navigation & simulation -->
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>nav2_voronoi_layer</exec_depend>
+
+  <!-- Visual SLAM backend (used by g1_explore_orbslam3.launch.py) -->
+  <!-- orb_slam3_ros2_wrapper must be built from source — see launch file for instructions -->
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>python3-transforms3d</exec_depend>
+  <exec_depend>topic_tools</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

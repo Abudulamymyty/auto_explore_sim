@@ -4,13 +4,15 @@ project(auto_explore_sim)
 find_package(ament_cmake REQUIRED)
 
 install(DIRECTORY
-  worlds config launch rviz
+  worlds config launch rviz models
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Install Python explorer script
+# Install Python scripts (LiDAR SLAM + ORB-SLAM3 visual SLAM helpers)
 install(PROGRAMS
   scripts/frontier_explorer.py
+  scripts/orb_slam3_tf_bridge.py
+  scripts/orb_slam3_map_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

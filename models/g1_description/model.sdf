@@ -1,0 +1,465 @@
+<?xml version="1.0"?>
+<!--
+  Unitree G1 Humanoid Robot — Gazebo Sim (Harmonic) SDF model
+  ============================================================
+  Standing-pose G1 with diff-drive locomotion for autonomous exploration.
+
+  The visual body is attached rigidly to a hidden diff-drive base.
+  Sensors:
+    - 360° 2-D LiDAR  (Livox Mid-360 position, at pelvis ~0.75 m)
+    - IMU              (in torso)
+    - RGBD Camera      (head position ~1.05 m, RGB + depth, 640×480, 60° HFOV)
+
+  Diff-drive wheels are invisible (small cylinders inside the feet area).
+  This lets Nav2/SLAM work identically to TurtleBot3, while the robot
+  *looks* like a G1 humanoid.
+
+  IMPORTANT — SDF link positioning:
+    In SDF (unlike URDF) child-link positions are set via <pose> on the
+    LINK element, NOT on the joint.  Joint <pose> only offsets the joint
+    frame inside the child link.
+-->
+<sdf version="1.9">
+  <model name="unitree_g1">
+    <self_collide>false</self_collide>
+
+    <!-- ==================== BASE FOOTPRINT ==================== -->
+    <link name="base_footprint"/>
+
+    <joint name="base_joint" type="fixed">
+      <parent>base_footprint</parent>
+      <child>base_link</child>
+    </joint>
+
+    <!-- ==================== BASE LINK (invisible drive platform) ==================== -->
+    <link name="base_link">
+      <pose>0 0 0.01 0 0 0</pose>
+      <inertial>
+        <mass>35.0</mass>
+        <inertia>
+          <ixx>0.50</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.50</iyy><iyz>0</iyz>
+          <izz>0.25</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Collision: box raised so wheels are the ground contact, not the box -->
+      <collision name="base_collision">
+        <pose>0 0 0.55 0 0 0</pose>
+        <geometry>
+          <box><size>0.40 0.30 0.80</size></box>
+        </geometry>
+      </collision>
+
+      <!-- ============== VISUAL MESHES (standing G1) ============== -->
+      <!-- Pelvis — base reference at z=0.752 from ground, offset by base_link at z=0.01 -->
+      <visual name="pelvis_visual">
+        <pose>0 0 0.742 0 0 0</pose>
+        <geometry><mesh><uri>meshes/pelvis.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="pelvis_contour_visual">
+        <pose>0 0 0.742 0 0 0</pose>
+        <geometry><mesh><uri>meshes/pelvis_contour_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+
+      <!-- Waist & Torso -->
+      <visual name="waist_yaw_visual">
+        <pose>0 0 0.742 0 0 0</pose>
+        <geometry><mesh><uri>meshes/waist_yaw_link_rev_1_0.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="waist_roll_visual">
+        <pose>-0.004 0 0.786 0 0 0</pose>
+        <geometry><mesh><uri>meshes/waist_roll_link_rev_1_0.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="torso_visual">
+        <pose>-0.004 0 0.786 0 0 0</pose>
+        <geometry><mesh><uri>meshes/torso_link_rev_1_0.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="logo_visual">
+        <pose>0 0 0.742 0 0 0</pose>
+        <geometry><mesh><uri>meshes/logo_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="head_visual">
+        <pose>0 0 0.742 0 0 0</pose>
+        <geometry><mesh><uri>meshes/head_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+
+      <!-- Left Leg -->
+      <visual name="left_hip_pitch_visual">
+        <pose>0 0.0645 0.6393 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_hip_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="left_hip_roll_visual">
+        <pose>0 0.1165 0.6088 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_hip_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="left_hip_yaw_visual">
+        <pose>0.025 0.1165 0.4847 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_hip_yaw_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="left_knee_visual">
+        <pose>-0.053 0.1186 0.3074 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_knee_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="left_ankle_pitch_visual">
+        <pose>-0.053 0.1185 0.0074 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_ankle_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="left_ankle_roll_visual">
+        <pose>-0.053 0.1185 -0.010 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_ankle_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+
+      <!-- Right Leg -->
+      <visual name="right_hip_pitch_visual">
+        <pose>0 -0.0645 0.6393 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_hip_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="right_hip_roll_visual">
+        <pose>0 -0.1165 0.6088 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_hip_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="right_hip_yaw_visual">
+        <pose>0.025 -0.1165 0.4847 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_hip_yaw_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="right_knee_visual">
+        <pose>-0.053 -0.1186 0.3074 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_knee_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="right_ankle_pitch_visual">
+        <pose>-0.053 -0.1185 0.0074 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_ankle_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="right_ankle_roll_visual">
+        <pose>-0.053 -0.1185 -0.010 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_ankle_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+
+      <!-- Left Arm -->
+      <visual name="left_shoulder_pitch_visual">
+        <pose>0 0.1002 1.0338 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_shoulder_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="left_shoulder_roll_visual">
+        <pose>0 0.1382 1.0199 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_shoulder_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="left_shoulder_yaw_visual">
+        <pose>0 0.1445 0.9167 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_shoulder_yaw_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="left_elbow_visual">
+        <pose>0.016 0.1445 0.8362 0 0 0</pose>
+        <geometry><mesh><uri>meshes/left_elbow_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+
+      <!-- Right Arm -->
+      <visual name="right_shoulder_pitch_visual">
+        <pose>0 -0.1002 1.0338 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_shoulder_pitch_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="right_shoulder_roll_visual">
+        <pose>0 -0.1382 1.0199 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_shoulder_roll_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+      <visual name="right_shoulder_yaw_visual">
+        <pose>0 -0.1445 0.9167 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_shoulder_yaw_link.STL</uri></mesh></geometry>
+        <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+      </visual>
+      <visual name="right_elbow_visual">
+        <pose>0.016 -0.1445 0.8362 0 0 0</pose>
+        <geometry><mesh><uri>meshes/right_elbow_link.STL</uri></mesh></geometry>
+        <material><ambient>0.7 0.7 0.7 1</ambient><diffuse>0.7 0.7 0.7 1</diffuse></material>
+      </visual>
+    </link>
+
+    <!-- ==================== IMU LINK ==================== -->
+    <link name="imu_link">
+      <pose relative_to="base_link">-0.040 -0.002 0.944 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-6</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>1e-6</iyy><iyz>0</iyz>
+          <izz>1e-6</izz>
+        </inertia>
+      </inertial>
+      <sensor name="imu" type="imu">
+        <always_on>true</always_on>
+        <update_rate>200</update_rate>
+        <imu>
+          <angular_velocity>
+            <x><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></x>
+            <y><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></y>
+            <z><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></x>
+            <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></y>
+            <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></z>
+          </linear_acceleration>
+        </imu>
+        <topic>/imu</topic>
+        <gz_frame_id>imu_link</gz_frame_id>
+      </sensor>
+    </link>
+    <joint name="imu_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>imu_link</child>
+    </joint>
+
+    <!-- ==================== LIDAR LINK (Livox Mid-360 position) ==================== -->
+    <link name="base_scan">
+      <pose relative_to="base_link">0 0 0.752 0 0 0</pose>
+      <inertial>
+        <mass>0.1</mass>
+        <inertia>
+          <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.0001</iyy><iyz>0</iyz>
+          <izz>0.0001</izz>
+        </inertia>
+      </inertial>
+      <sensor name="gpu_lidar" type="gpu_lidar">
+        <always_on>true</always_on>
+        <update_rate>5</update_rate>
+        <topic>/scan</topic>
+        <gz_frame_id>base_scan</gz_frame_id>
+        <lidar>
+          <scan>
+            <horizontal>
+              <samples>360</samples>
+              <resolution>1</resolution>
+              <min_angle>0.0</min_angle>
+              <max_angle>6.28318</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>1</samples>
+              <resolution>1</resolution>
+              <min_angle>0</min_angle>
+              <max_angle>0</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.12</min>
+            <max>20.0</max>
+            <resolution>0.015</resolution>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.01</stddev>
+          </noise>
+        </lidar>
+        <visualize>true</visualize>
+      </sensor>
+    </link>
+    <joint name="scan_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>base_scan</child>
+    </joint>
+
+    <!-- ==================== RGBD CAMERA LINK (head position ~1.05 m) ==================== -->
+    <!-- Placed at the G1 head, slightly forward-facing.  Provides RGB + depth for ORB-SLAM3. -->
+    <link name="camera_link">
+      <pose relative_to="base_link">0.10 0 1.05 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.0001</iyy><iyz>0</iyz>
+          <izz>0.0001</izz>
+        </inertia>
+      </inertial>
+
+      <!-- RGBD camera: publishes RGB image, depth image, camera_info, and point cloud.
+           Gazebo Harmonic rgbd_camera sub-topics (base = /camera):
+             /camera/image        – RGB  (gz.msgs.Image)
+             /camera/depth_image  – Depth (gz.msgs.Image, float32 metres)
+             /camera/camera_info  – CameraInfo
+             /camera/points       – PointCloud2
+           ORB-SLAM3 intrinsics from 60° HFOV, 640×480:
+             fx = fy = 320 / tan(30°) ≈ 554.3   cx = 320   cy = 240 -->
+      <sensor name="rgbd_camera" type="rgbd_camera">
+        <always_on>true</always_on>
+        <update_rate>15</update_rate>
+        <topic>/camera</topic>
+        <gz_frame_id>camera_link</gz_frame_id>
+        <camera>
+          <horizontal_fov>1.0472</horizontal_fov>  <!-- 60 degrees -->
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>10.0</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
+      </sensor>
+    </link>
+    <joint name="camera_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+    </joint>
+
+    <!-- ==================== LEFT WHEEL ==================== -->
+    <link name="wheel_left_link">
+      <pose relative_to="base_link">-0.03 0.12 0.05 0 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.001</iyy><iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+      <collision name="wheel_left_collision">
+        <pose>0 0 0 -1.5707963 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.02</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode><mu>1.0</mu><mu2>1.0</mu2></ode>
+          </friction>
+        </surface>
+      </collision>
+    </link>
+    <joint name="wheel_left_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>wheel_left_link</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+      </axis>
+    </joint>
+
+    <!-- ==================== RIGHT WHEEL ==================== -->
+    <link name="wheel_right_link">
+      <pose relative_to="base_link">-0.03 -0.12 0.05 0 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.001</iyy><iyz>0</iyz>
+          <izz>0.001</izz>
+        </inertia>
+      </inertial>
+      <collision name="wheel_right_collision">
+        <pose>0 0 0 -1.5707963 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.05</radius>
+            <length>0.02</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode><mu>1.0</mu><mu2>1.0</mu2></ode>
+          </friction>
+        </surface>
+      </collision>
+    </link>
+    <joint name="wheel_right_joint" type="revolute">
+      <parent>base_link</parent>
+      <child>wheel_right_link</child>
+      <axis>
+        <xyz>0 1 0</xyz>
+      </axis>
+    </joint>
+
+    <!-- ==================== CASTER (back) ==================== -->
+    <link name="caster_link">
+      <pose relative_to="base_link">0.10 0 0.05 0 0 0</pose>
+      <inertial>
+        <mass>0.2</mass>
+        <inertia>
+          <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.0001</iyy><iyz>0</iyz>
+          <izz>0.0001</izz>
+        </inertia>
+      </inertial>
+      <collision name="caster_collision">
+        <geometry>
+          <sphere><radius>0.05</radius></sphere>
+        </geometry>
+        <surface>
+          <friction>
+            <ode><mu>0.0</mu><mu2>0.0</mu2></ode>
+          </friction>
+        </surface>
+      </collision>
+    </link>
+    <joint name="caster_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>caster_link</child>
+    </joint>
+
+    <!-- ==================== PLUGINS ==================== -->
+
+    <!-- Differential Drive -->
+    <plugin filename="gz-sim-diff-drive-system"
+            name="gz::sim::systems::DiffDrive">
+      <left_joint>wheel_left_joint</left_joint>
+      <right_joint>wheel_right_joint</right_joint>
+      <wheel_separation>0.24</wheel_separation>
+      <wheel_radius>0.05</wheel_radius>
+      <max_linear_acceleration>1.5</max_linear_acceleration>
+      <min_linear_acceleration>-1.5</min_linear_acceleration>
+      <max_angular_acceleration>2.5</max_angular_acceleration>
+      <min_angular_acceleration>-2.5</min_angular_acceleration>
+      <max_linear_velocity>0.8</max_linear_velocity>
+      <max_angular_velocity>1.5</max_angular_velocity>
+      <odom_topic>/odom</odom_topic>
+      <tf_topic>/tf</tf_topic>
+      <frame_id>odom</frame_id>
+      <child_frame_id>base_footprint</child_frame_id>
+      <odom_publish_frequency>30</odom_publish_frequency>
+      <topic>/cmd_vel</topic>
+    </plugin>
+
+    <!-- Joint State Publisher (for wheels) -->
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher">
+      <joint_name>wheel_left_joint</joint_name>
+      <joint_name>wheel_right_joint</joint_name>
+      <update_rate>30</update_rate>
+      <topic>/joint_states</topic>
+    </plugin>
+
+  </model>
+</sdf>

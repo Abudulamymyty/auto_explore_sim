@@ -1,0 +1,137 @@
+<?xml version="1.0"?>
+<!--
+  Unitree G1 Humanoid — URDF for robot_state_publisher
+  =====================================================
+  Defines only the TF tree (frames + joints). Sensors/plugins are in the SDF.
+  The diff-drive base is hidden; the visual meshes are in the SDF too.
+
+  TF tree:
+    base_footprint -> base_link -> imu_link
+                                -> base_scan
+                                -> camera_link   (RGBD head camera, for ORB-SLAM3)
+                                -> wheel_left_link
+                                -> wheel_right_link
+                                -> caster_link
+                                -> pelvis (visual frame)
+-->
+<robot name="unitree_g1">
+
+  <!-- ========== BASE FOOTPRINT ========== -->
+  <link name="base_footprint"/>
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.01" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ========== BASE LINK ========== -->
+  <link name="base_link">
+    <inertial>
+      <mass value="35.0"/>
+      <origin xyz="0 0 0.45" rpy="0 0 0"/>
+      <inertia ixx="0.50" ixy="0" ixz="0" iyy="0.50" iyz="0" izz="0.25"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.45" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.40 0.30 0.90"/>
+      </geometry>
+      <material name="dark_grey">
+        <color rgba="0.3 0.3 0.3 0.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.45" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.40 0.30 0.90"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ========== IMU LINK ========== -->
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="-0.040 -0.002 0.944" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ========== LIDAR LINK ========== -->
+  <link name="base_scan"/>
+  <joint name="scan_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_scan"/>
+    <origin xyz="0 0 0.752" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ========== RGBD CAMERA LINK (head, for ORB-SLAM3) ========== -->
+  <!-- Must match the SDF camera_link placement: x=0.10, z=1.05 from base_link -->
+  <link name="camera_link"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.10 0 1.05" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ========== LEFT WHEEL ========== -->
+  <link name="wheel_left_link">
+    <inertial>
+      <mass value="0.5"/>
+      <origin xyz="0 0 0" rpy="-1.5707963 0 0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="-1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="wheel_left_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_left_link"/>
+    <origin xyz="-0.03 0.12 0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ========== RIGHT WHEEL ========== -->
+  <link name="wheel_right_link">
+    <inertial>
+      <mass value="0.5"/>
+      <origin xyz="0 0 0" rpy="-1.5707963 0 0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="-1.5707963 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="wheel_right_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_right_link"/>
+    <origin xyz="-0.03 -0.12 0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- ========== CASTER ========== -->
+  <link name="caster_link">
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <collision>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="caster_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="caster_link"/>
+    <origin xyz="0.10 0 0.05" rpy="0 0 0"/>
+  </joint>
+
+</robot>

@@ -1,0 +1,70 @@
+%YAML:1.0
+# =============================================================================
+# ORB-SLAM3 Camera Settings — Unitree G1 Simulated RGBD Camera
+# =============================================================================
+# Gazebo rgbd_camera sensor: 640×480, 60° HFOV
+#
+# Intrinsics derived from SDF sensor parameters:
+#   horizontal_fov = 1.0472 rad (60°)
+#   width  = 640 px  →  cx = 320
+#   height = 480 px  →  cy = 240
+#   fx = fy = (width/2) / tan(hfov/2) = 320 / tan(30°) ≈ 554.26
+#
+# No lens distortion in a simulated camera.
+# =============================================================================
+
+Camera.type: "PinHole"
+
+# Intrinsics (pixels)
+Camera.fx: 554.26
+Camera.fy: 554.26
+Camera.cx: 320.0
+Camera.cy: 240.0
+
+# Distortion coefficients — zero for ideal simulated camera
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
+
+# Image size
+Camera.width:  640
+Camera.height: 480
+
+# Frames per second (must match Gazebo update_rate)
+Camera.fps: 15
+
+# 1=RGB, 0=BGR — Gazebo publishes R8G8B8 in RGB order
+Camera.RGB: 1
+
+# Depth scale: depth image pixel value → metres.
+# Gazebo rgbd_camera depth image is already in metres (float32), so factor = 1.
+DepthMapFactor: 1.0
+
+# Depth threshold: baseline × ThDepth = max reliable stereo depth.
+# For a virtual stereo baseline of ~0.12 m and typical indoor range (~4 m):
+#   ThDepth ≈ 4.0 / 0.12 ≈ 33 → use 35 for a small margin.
+ThDepth: 35.0
+
+# =============================================================================
+# ORB Feature Extractor
+# =============================================================================
+ORBextractor.nFeatures:    1000   # number of features per frame
+ORBextractor.scaleFactor:  1.2    # scale between pyramid levels
+ORBextractor.nLevels:      8      # pyramid levels
+ORBextractor.iniThFAST:    20     # initial FAST threshold
+ORBextractor.minThFAST:    7      # fallback FAST threshold
+
+# =============================================================================
+# Viewer (Pangolin) — disabled in headless/simulation mode via launch param
+# =============================================================================
+Viewer.KeyFrameSize:        0.05
+Viewer.KeyFrameLineWidth:   1.0
+Viewer.GraphLineWidth:      0.9
+Viewer.PointSize:           2.0
+Viewer.CameraSize:          0.08
+Viewer.CameraLineWidth:     3.0
+Viewer.ViewpointX:          0.0
+Viewer.ViewpointY:         -0.7
+Viewer.ViewpointZ:         -1.8
+Viewer.ViewpointF:          500.0
