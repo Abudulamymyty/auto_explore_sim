@@ -235,7 +235,8 @@
       <child>imu_link</child>
     </joint>
 
-    <!-- ==================== LIDAR LINK (Livox Mid-360 position) ==================== -->
+    <!-- ==================== LIDAR LINK (Livox Mid-360, 3D) ==================== -->
+    <!-- Changed from 2D to 3D multi-beam lidar for FastLivo -->
     <link name="base_scan">
       <pose relative_to="base_link">0 0 0.752 0 0 0</pose>
       <inertial>
@@ -246,26 +247,41 @@
           <izz>0.0001</izz>
         </inertia>
       </inertial>
+      <!-- Livox Mid-360: 6 scan lines, 70.4° vertical FOV, 360° horizontal -->
       <sensor name="gpu_lidar" type="gpu_lidar">
         <always_on>true</always_on>
-        <update_rate>5</update_rate>
-        <topic>/scan</topic>
+        <update_rate>10</update_rate>
+        <topic>/livox/lidar</topic>
         <gz_frame_id>base_scan</gz_frame_id>
         <lidar>
           <scan>
             <horizontal>
-              <samples>360</samples>
+              <samples>480</samples>
               <resolution>1</resolution>
               <min_angle>0.0</min_angle>
               <max_angle>6.28318</max_angle>
             </horizontal>
             <vertical>
-              <samples>1</samples>
+              <samples>6</samples>
               <resolution>1</resolution>
-              <min_angle>0</min_angle>
-              <max_angle>0</max_angle>
+              <min_angle>-0.5236</min_angle>
+              <max_angle>0.5236</max_angle>
             </vertical>
           </scan>
+          <range>
+            <min>0.1</min>
+            <max>100.0</max>
+            <resolution>0.01</resolution>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.01</stddev>
+          </noise>
+        </lidar>
+        <visualize>true</visualize>
+      </sensor>
+    </link>
           <range>
             <min>0.12</min>
             <max>20.0</max>

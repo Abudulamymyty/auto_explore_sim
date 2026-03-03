@@ -1,0 +1,92 @@
+# =============================================================================
+# FastLivo Parameters for Unitree G1 + Gazebo Simulation
+# =============================================================================
+# Adapted from avia.yaml for G1 simulation with:
+#   - Livox Mid-360 (simulated 3D lidar)
+#   - IMU at torso
+#   - RGBD Camera for visual odometry
+# =============================================================================
+
+common:
+  img_topic: "/camera/image"
+  lid_topic: "/livox/lidar"
+  imu_topic: "/imu"
+  img_en: 1
+  lidar_en: 1
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  # Livox mounted at pelvis (z=0.752m), camera at head (z=1.05m, x=0.1m)
+  # These are approximate - tune after first run
+  extrinsic_T: [0.0, 0.0, 0.3]  # lidar to imu offset
+  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  Rcl: [1, 0, 0, 0, 1, 0, 0, 0, 1]  # Identity for now
+  Pcl: [0, 0, 0]
+
+time_offset: 
+  imu_time_offset: 0.0
+  img_time_offset: 0.0
+  exposure_time_init: 0.0
+
+preprocess:
+  point_filter_num: 1
+  filter_size_surf: 0.1
+  lidar_type: 1  # Livox Avia type
+  scan_line: 6   # 6 beams for Mid-360 simulation
+  blind: 0.5     # Closer blind range for indoor
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 1000
+  img_point_cov: 100
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  acc_cov: 0.5   # Accelerometer noise (tune based on sim)
+  gyr_cov: 0.3   # Gyroscope noise
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.0025
+  voxel_size: 0.5
+  max_layer: 2
+  max_points_num: 50
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:  
+  map_sliding_en: false
+  half_map_size: 100
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: false
+
+publish:
+  dense_map_en: true
+  pub_effect_point_en: false 
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "g1_simulation"
+  pose_output_en: false
+
+pcd_save:
+  pcd_save_en: false
+  colmap_output_en: false
+  filter_size_pcd: 0.15
+  interval: -1

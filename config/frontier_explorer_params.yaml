@@ -26,7 +26,7 @@ frontier_explorer:
 
     # Minimum number of frontier cells in a cluster to be considered
     # a valid frontier. Filters noise / tiny gaps.
-    min_frontier_size: 20
+    min_frontier_size: 40
 
     # --- GVD clearance tiebreaker ---
     # Among roughly equidistant frontiers, prefer those in wider corridors.
@@ -37,7 +37,7 @@ frontier_explorer:
 
     # If no movement > 0.3 m within this many seconds, cancel goal
     # and blacklist the frontier.
-    progress_timeout: 30.0
+    progress_timeout: 15.0
 
     # Blacklisted frontier expiry time (seconds). After this long the
     # frontier can be targeted again.

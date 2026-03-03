@@ -1,8 +1,7 @@
 # ros_gz_bridge configuration for Unitree G1
 # Bridges Gazebo Sim topics to/from ROS 2
 #
-# Follows the same pattern as nav2_minimal_tb3_sim's bridge config
-# with explicit per-topic direction control.
+# Updated for FastLivo: 3D Livox PointCloud instead of 2D scan
 ---
 - topic_name: "/clock"
   ros_type_name: "rosgraph_msgs/msg/Clock"
@@ -19,11 +18,13 @@
   gz_type_name: "gz.msgs.Odometry"
   direction: GZ_TO_ROS
 
-- topic_name: "/scan"
-  ros_type_name: "sensor_msgs/msg/LaserScan"
-  gz_type_name: "gz.msgs.LaserScan"
+# 3D Livox PointCloud (for FastLivo)
+- topic_name: "/livox/lidar"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
   direction: GZ_TO_ROS
 
+# IMU (for FastLivo)
 - topic_name: "/imu"
   ros_type_name: "sensor_msgs/msg/Imu"
   gz_type_name: "gz.msgs.IMU"
@@ -39,14 +40,7 @@
   gz_type_name: "gz.msgs.Model"
   direction: GZ_TO_ROS
 
-# --- RGBD Camera (for ORB-SLAM3) ---
-# Gazebo rgbd_camera sensor publishes four sub-topics under the base topic /camera:
-#   /camera/image        – RGB image
-#   /camera/depth_image  – Depth image (float32, metres)
-#   /camera/camera_info  – CameraInfo (shared by RGB and depth)
-#   /camera/points       – PointCloud2
-# The launch file remaps these to the names orb_slam3_ros2_wrapper expects.
-
+# --- RGBD Camera (for ORB-SLAM3 / FastLivo visual) ---
 - topic_name: "/camera/image"
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
