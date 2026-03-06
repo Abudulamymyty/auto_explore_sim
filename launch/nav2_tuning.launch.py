@@ -23,9 +23,9 @@ from launch.actions import (
     IncludeLaunchDescription,
     SetEnvironmentVariable,
 )
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 from launch_ros.actions import Node, SetParameter
 from launch_ros.descriptions import ParameterFile
@@ -110,7 +110,13 @@ def generate_launch_description():
     gazebo_client = ExecuteProcess(
         cmd=['gz', 'sim', '-g'],
         output='screen',
-        condition=UnlessCondition(headless),
+        # Show Gazebo GUI whenever RViz is requested, even if headless:=true
+        condition=IfCondition(
+            PythonExpression([
+                '"', use_rviz, '" == "true" or "',
+                headless, '" == "false"'
+            ])
+        ),
     )
 
     # ===== 3. Spawn TB3 in Gazebo =====

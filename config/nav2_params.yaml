@@ -35,8 +35,8 @@ bt_navigator:
 # -----------------------------------------------------------------------------
 controller_server:
   ros__parameters:
-    controller_frequency: 20.0              # Control loop rate (Hz)
-    costmap_update_timeout: 0.30            # Max wait for costmap update (s)
+    controller_frequency: 25.0              # Faster control loop response (Hz)
+    costmap_update_timeout: 0.20            # Faster timeout for stale costmap data (s)
     min_x_velocity_threshold: 0.001         # Below this = zero linear velocity
     min_y_velocity_threshold: 0.5           # N/A for diff drive (no lateral)
     min_theta_velocity_threshold: 0.001     # Below this = zero angular velocity
@@ -66,8 +66,8 @@ controller_server:
     # Samples thousands of trajectories and picks the lowest-cost one
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
-      time_steps: 56                        # Trajectory rollout length (steps)
-      model_dt: 0.05                        # Time between steps (s) → 56*0.05 = 2.8s lookahead
+      time_steps: 48                        # Shorter horizon for quicker local reaction
+      model_dt: 0.04                        # 48*0.04 = 1.92s lookahead
       batch_size: 1000                      # Number of sampled trajectories per iteration
       # Acceleration limits
       ax_max: 2.5                           # Max forward acceleration (m/s²)
@@ -76,18 +76,18 @@ controller_server:
       ay_min: -1.0
       az_max: 3.2                           # Max angular acceleration (rad/s²)
       # Noise standard deviations for trajectory sampling
-      vx_std: 0.1                           # Linear velocity noise
+      vx_std: 0.14                          # More exploratory linear samples
       vy_std: 0.1                           # Lateral velocity noise (unused)
-      wz_std: 0.2                           # Angular velocity noise
+      wz_std: 0.28                          # More exploratory angular samples
       # Velocity limits (TB3 Waffle hardware limits)
       vx_max: 1.0                        # Max forward speed (m/s)
       vx_min: -0.10                        # Barely allow reverse — forces rotate-in-place
       vy_max: 0.0                           # No lateral movement (diff drive)
       wz_max: 1.9                           # Higher angular vel — faster in-place rotation (rad/s)
-      iteration_count: 2                    # MPPI optimization iterations per cycle
-      prune_distance: 2.5                   # Keep more path behind robot — stabilizes path commitment (m)
-      transform_tolerance: 0.5              # TF lookup tolerance (s)
-      temperature: 0.3                      # Lower = greedier, less random path-switching
+      iteration_count: 3                    # More optimization each cycle
+      prune_distance: 1.8                   # Re-align to refreshed path more aggressively (m)
+      transform_tolerance: 0.2              # Tighter TF tolerance for responsive control
+      temperature: 0.25                     # More sensitive / less random trajectory choice
       gamma: 0.015                          # Free energy term weight
       motion_model: "DiffDrive"             # Differential drive kinematics
       visualize: false
@@ -120,8 +120,8 @@ controller_server:
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.0
-        threshold_to_consider: 0.5
+        cost_weight: 4.0
+        threshold_to_consider: 0.7
 
       # Penalizes reversing — high weight forces robot to rotate in place
       # then drive forward rather than backing up near walls
@@ -152,11 +152,11 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 22.0                   # Was 14.0 — strongly stick to current path
+        cost_weight: 30.0                   # Stronger path-locking behavior
         max_path_occupancy_ratio: 0.40      # Was 0.05 — still follow path even if 40% is in obstacles
         trajectory_point_step: 4
-        threshold_to_consider: 0.5
-        offset_from_furthest: 20
+        threshold_to_consider: 0.2
+        offset_from_furthest: 15
         use_path_orientations: false
 
       # Penalizes distance from the furthest reachable path point
@@ -164,16 +164,16 @@ controller_server:
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 12.0                   # Was 5.0 — pull strongly toward furthest path point
-        offset_from_furthest: 20            # Was 5 — look 20 points ahead (≈1m at 0.05 res)
-        threshold_to_consider: 1.4
+        cost_weight: 18.0                   # Stronger pull to planned path
+        offset_from_furthest: 15            # Slightly shorter look-ahead for quicker correction
+        threshold_to_consider: 1.0
 
       # Penalizes heading deviation from path direction
       PathAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 15.0
-        offset_from_furthest: 4
+        cost_weight: 20.0
+        offset_from_furthest: 6
         threshold_to_consider: 0.5
         max_angle_to_furthest: 1.0
         mode: 0
@@ -247,7 +247,7 @@ global_costmap:
       robot_radius: 0.15
       resolution: 0.05
       track_unknown_space: true             # Mark unseen areas as unknown (for exploration)
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer", "voronoi_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
 
       # Subscribes to SLAM-generated map
       static_layer:
@@ -282,16 +282,6 @@ global_costmap:
         # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
         inflation_radius: 0.20
 
-      # GVD-based corridor preference layer.
-      # Adds cost near walls so the planner prefers routes through corridor
-      # centers (medial axis / Voronoi diagram).
-      # Must come AFTER inflation_layer in the plugins list.
-      voronoi_layer:
-        plugin: "nav2_voronoi_layer::VoronoiLayer"
-        enabled: true
-        max_cost: 120.0           # Extra cost at min_clearance distance (0-252)
-        decay_factor: 3.0        # Exponential decay rate toward corridor center
-        min_clearance: 0.22      # Don't add cost within inscribed radius (m)
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
@@ -375,7 +365,7 @@ behavior_server:
     # think they'll collide and refuse to execute. 0.8s is enough to be safe
     # while still allowing recovery in narrow corridors.
     simulate_ahead_time: 0.8
-    max_rotational_vel: 1.0                 # Spin recovery max speed (rad/s)
+    max_rotational_vel: 2.0                 # Spin recovery max speed (rad/s)
     min_rotational_vel: 0.2                 # Was 0.4 — slower spin for tight spaces
     rotational_acc_lim: 1.6
 
@@ -386,7 +376,7 @@ behavior_server:
 # -----------------------------------------------------------------------------
 velocity_smoother:
   ros__parameters:
-    smoothing_frequency: 20.0               # Must match controller_frequency
+    smoothing_frequency: 25.0               # Match controller_frequency
     scale_velocities: False                 # Don't scale down — just clip
     feedback: "OPEN_LOOP"                   # No odometry feedback (simpler)
     max_velocity: [1.0, 0.0, 1.9]          # [vx, vy, wz] must match MPPI limits
