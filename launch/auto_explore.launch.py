@@ -1,6 +1,6 @@
 """
 All-in-one launch for autonomous exploration:
-  Gazebo (office world) + TB3 Waffle + SLAM Toolbox + Nav2 + explore_lite + RViz
+  Gazebo (office world) + TB3 Waffle + SLAM Toolbox + Nav2 + Frontier Explorer + RViz
 """
 
 import os
@@ -36,6 +36,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_rviz = LaunchConfiguration('use_rviz')
     headless = LaunchConfiguration('headless')
+    explorer_impl = LaunchConfiguration('explorer_impl')
 
     # Declare launch arguments
     declare_use_sim_time = DeclareLaunchArgument(
@@ -49,6 +50,10 @@ def generate_launch_description():
     declare_headless = DeclareLaunchArgument(
         'headless', default_value='false',
         description='Run Gazebo headless (no GUI)')
+
+    declare_explorer_impl = DeclareLaunchArgument(
+        'explorer_impl', default_value='cpp',
+        description='Explorer implementation: python or cpp')
 
     # File paths
     world_file = os.path.join(pkg_dir, 'worlds', 'office.sdf')
@@ -233,6 +238,19 @@ def generate_launch_description():
                 name='frontier_explorer',
                 output='screen',
                 parameters=[explore_params_file, {'use_sim_time': use_sim_time}],
+                condition=IfCondition(
+                    PythonExpression(['"', explorer_impl, '" == "python"'])
+                ),
+            ),
+            Node(
+                package='auto_explore_sim',
+                executable='frontier_explorer',
+                name='frontier_explorer',
+                output='screen',
+                parameters=[explore_params_file, {'use_sim_time': use_sim_time}],
+                condition=IfCondition(
+                    PythonExpression(['"', explorer_impl, '" == "cpp"'])
+                ),
             ),
         ],
     )
@@ -257,6 +275,7 @@ def generate_launch_description():
     ld.add_action(declare_use_sim_time)
     ld.add_action(declare_use_rviz)
     ld.add_action(declare_headless)
+    ld.add_action(declare_explorer_impl)
 
     # Start simulation
     ld.add_action(gazebo_server)

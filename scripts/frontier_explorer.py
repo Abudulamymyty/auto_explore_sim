@@ -18,22 +18,24 @@ Key features:
 
 import heapq
 import math
+import time
 from collections import deque
 
 import numpy as np
 import rclpy
+from scipy import ndimage
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
+from rclpy.time import Time
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import Bool
 from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
+from tf2_msgs.msg import TFMessage
 from visualization_msgs.msg import Marker, MarkerArray
-
-import tf2_ros
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +43,13 @@ import tf2_ros
 # ---------------------------------------------------------------------------
 class Frontier:
     """One frontier cluster discovered by BFS."""
-    __slots__ = ('size', 'min_distance', 'cost', 'centroid', 'middle',
-                 'initial', 'points')
+    __slots__ = ('size', 'min_distance', 'cost', 'centroid')
 
     def __init__(self):
         self.size = 0               # number of cells
         self.min_distance = float('inf')
         self.cost = 0.0
         self.centroid = (0.0, 0.0)  # average of all points (world coords)
-        self.middle = (0.0, 0.0)    # point at size//2 (world coords)
-        self.initial = (0.0, 0.0)   # first point found (world coords)
-        self.points = []            # all points as (wx, wy)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +66,8 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('planner_frequency', 0.5)        # Hz
         self.declare_parameter('min_frontier_size', 5)           # cells
         self.declare_parameter('robot_base_frame', 'base_link')
+        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('transform_tolerance', 2.0)
         self.declare_parameter('blacklist_radius', 0.5)          # metres
@@ -80,11 +80,19 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('gvd_min_clearance', 3)     # min obstacle dist (cells)
         self.declare_parameter('gvd_snap_radius', 2.0)     # max snap search (metres)
         self.declare_parameter('visualize_gvd', True)
+        self.declare_parameter('gvd_marker_publish_every', 1)
+        self.declare_parameter('gvd_marker_stride', 1)
+        self.declare_parameter('profile_timing', False)
+        self.declare_parameter('profile_log_interval', 15.0)
+        self.declare_parameter('profile_callbacks', False)
+        self.declare_parameter('profile_callback_log_interval', 10.0)
 
         # ── Read parameters ─────────────────────────────────────────────
         self.planner_freq = self.get_parameter('planner_frequency').value
         self.min_frontier_size = self.get_parameter('min_frontier_size').value
         self.robot_base_frame = self.get_parameter('robot_base_frame').value
+        self.odom_frame = self.get_parameter('odom_frame').value
+        self.odom_topic = self.get_parameter('odom_topic').value
         self.global_frame = self.get_parameter('global_frame').value
         self.tf_tolerance = self.get_parameter('transform_tolerance').value
         self.blacklist_radius = self.get_parameter('blacklist_radius').value
@@ -97,15 +105,32 @@ class FrontierExplorerNode(Node):
         self.gvd_min_clearance = self.get_parameter('gvd_min_clearance').value
         self.gvd_snap_radius = self.get_parameter('gvd_snap_radius').value
         self.visualize_gvd = self.get_parameter('visualize_gvd').value
-
-        # ── TF listener ─────────────────────────────────────────────────
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.gvd_marker_publish_every = max(
+            1, int(self.get_parameter('gvd_marker_publish_every').value))
+        self.gvd_marker_stride = max(
+            1, int(self.get_parameter('gvd_marker_stride').value))
+        self.profile_timing = self.get_parameter('profile_timing').value
+        self.profile_log_interval = self.get_parameter('profile_log_interval').value
+        self.profile_callbacks = self.get_parameter('profile_callbacks').value
+        self.profile_callback_log_interval = self.get_parameter(
+            'profile_callback_log_interval').value
 
         # ── Subscribers ─────────────────────────────────────────────────
+        tf_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=100,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
         self.map_data = None
+        self.map_array = None
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self._map_callback, 10)
+        self.odom_sub = self.create_subscription(
+            Odometry, self.odom_topic, self._odom_callback, 20)
+        self.tf_sub = self.create_subscription(
+            TFMessage, '/tf', self._tf_callback, tf_qos)
 
         # Stop / resume subscription
         self.exploring = True
@@ -146,6 +171,28 @@ class FrontierExplorerNode(Node):
         self._cached_map_stamp = None
         self._cached_label_map = None       # obstacle label map for GVD
         self._cached_gvd_mask = None        # boolean GVD point mask
+        self._cached_frontier_mask = None   # boolean frontier candidate mask
+        self._cached_frontier_stamp = None
+        self._cached_gvd_marker_array = None
+        self._cached_gvd_marker_stamp = None
+        self._gvd_marker_publish_counter = 0
+        self._timing_totals = {}
+        self._timing_counts = {}
+        self._timing_max = {}
+        self._timing_last_log = time.perf_counter()
+        self._timing_plan_counter = 0
+        self._callback_totals = {}
+        self._callback_counts = {}
+        self._callback_max = {}
+        self._callback_last_log = time.perf_counter()
+        self._odom_pose_xy = None
+        self._odom_stamp = None
+        self._map_to_odom_xy = None
+        self._map_to_odom_yaw = None
+        self._map_to_odom_stamp = None
+        self._robot_pose_xy = None
+        self._robot_pose_stamp = None
+        self._using_nav_feedback_pose = False
 
         # ── Timer ───────────────────────────────────────────────────────
         period = 1.0 / max(self.planner_freq, 0.01)
@@ -156,6 +203,9 @@ class FrontierExplorerNode(Node):
             f'min_frontier={self.min_frontier_size} cells, '
             f'clearance_scale={self.clearance_scale}, '
             f'gvd_snap_radius={self.gvd_snap_radius}m, '
+            f'gvd_marker_every={self.gvd_marker_publish_every}, '
+            f'gvd_marker_stride={self.gvd_marker_stride}, '
+            f'profile_callbacks={self.profile_callbacks}, '
             f'return_to_init={self.return_to_init})')
 
     # ================================================================
@@ -163,27 +213,290 @@ class FrontierExplorerNode(Node):
     # ================================================================
 
     def _map_callback(self, msg: OccupancyGrid):
-        self.map_data = msg
+        started = time.perf_counter()
+        try:
+            self.map_data = msg
+            info = msg.info
+            self.map_array = np.asarray(msg.data, dtype=np.int8).reshape(
+                (info.height, info.width))
+        finally:
+            self._record_callback_timing(
+                'map_callback', time.perf_counter() - started)
+
+    def _odom_callback(self, msg: Odometry):
+        """Cache robot pose in the odom frame."""
+        started = time.perf_counter()
+        try:
+            frame_id = self._normalize_frame_id(msg.header.frame_id)
+            if frame_id and frame_id != self.odom_frame:
+                self.get_logger().warning(
+                    f'Ignoring odom pose in unexpected frame {frame_id!r}; '
+                    f'expected {self.odom_frame!r}',
+                    throttle_duration_sec=5.0)
+                return
+
+            prev_odom_xy = self._odom_pose_xy
+            new_odom_xy = (
+                float(msg.pose.pose.position.x),
+                float(msg.pose.pose.position.y),
+            )
+            self._odom_pose_xy = new_odom_xy
+            self._odom_stamp = msg.header.stamp
+
+            # After initial map pose bootstrap, integrate odom deltas directly
+            # instead of processing the full TF stream continuously.
+            if (self.tf_sub is None
+                    and prev_odom_xy is not None
+                    and self._robot_pose_xy is not None
+                    and self._map_to_odom_yaw is not None):
+                dx = new_odom_xy[0] - prev_odom_xy[0]
+                dy = new_odom_xy[1] - prev_odom_xy[1]
+                cos_y = math.cos(self._map_to_odom_yaw)
+                sin_y = math.sin(self._map_to_odom_yaw)
+                self._robot_pose_xy = (
+                    self._robot_pose_xy[0] + cos_y * dx - sin_y * dy,
+                    self._robot_pose_xy[1] + sin_y * dx + cos_y * dy,
+                )
+                return
+
+            self._update_robot_pose_cache()
+        finally:
+            self._record_callback_timing(
+                'odom_callback', time.perf_counter() - started)
+
+    def _nav_feedback_cb(self, feedback_msg):
+        """Update cached robot pose from Nav2 action feedback."""
+        started = time.perf_counter()
+        try:
+            current_pose = feedback_msg.feedback.current_pose
+            frame_id = self._normalize_frame_id(current_pose.header.frame_id)
+            if frame_id and frame_id != self.global_frame:
+                self.get_logger().warning(
+                    f'Ignoring Nav2 feedback pose in unexpected frame {frame_id!r}; '
+                    f'expected {self.global_frame!r}',
+                    throttle_duration_sec=5.0)
+                return
+
+            self._robot_pose_xy = (
+                float(current_pose.pose.position.x),
+                float(current_pose.pose.position.y),
+            )
+            self._robot_pose_stamp = current_pose.header.stamp
+
+            if not self._using_nav_feedback_pose:
+                self._using_nav_feedback_pose = True
+                if self.odom_sub is not None:
+                    self.get_logger().info(
+                        'Switching from /odom tracking to Nav2 feedback pose tracking')
+                    self.destroy_subscription(self.odom_sub)
+                    self.odom_sub = None
+        finally:
+            self._record_callback_timing(
+                'nav_feedback_cb', time.perf_counter() - started)
+
+    def _tf_callback(self, msg: TFMessage):
+        """Cache only the map->odom transform we need for pose composition."""
+        started = time.perf_counter()
+        try:
+            updated = False
+
+            for transform in msg.transforms:
+                parent = self._normalize_frame_id(transform.header.frame_id)
+                child = self._normalize_frame_id(transform.child_frame_id)
+
+                if parent == self.global_frame and child == self.odom_frame:
+                    self._store_map_to_odom(
+                        transform.transform.translation.x,
+                        transform.transform.translation.y,
+                        self._yaw_from_quaternion(transform.transform.rotation),
+                        transform.header.stamp)
+                    updated = True
+                elif parent == self.odom_frame and child == self.global_frame:
+                    tx = float(transform.transform.translation.x)
+                    ty = float(transform.transform.translation.y)
+                    yaw = self._yaw_from_quaternion(transform.transform.rotation)
+                    cos_y = math.cos(yaw)
+                    sin_y = math.sin(yaw)
+                    self._store_map_to_odom(
+                        -(cos_y * tx + sin_y * ty),
+                        sin_y * tx - cos_y * ty,
+                        -yaw,
+                        transform.header.stamp)
+                    updated = True
+
+            if updated:
+                self._update_robot_pose_cache()
+        finally:
+            self._record_callback_timing(
+                'tf_callback', time.perf_counter() - started)
 
     def _resume_callback(self, msg: Bool):
-        if msg.data:
-            self.get_logger().info('Exploration RESUMED')
-            self.exploring = True
-        else:
-            self.get_logger().info('Exploration STOPPED')
-            self.exploring = False
-            self._cancel_current_goal()
-            self.navigating = False
+        started = time.perf_counter()
+        try:
+            if msg.data:
+                self.get_logger().info('Exploration RESUMED')
+                self.exploring = True
+            else:
+                self.get_logger().info('Exploration STOPPED')
+                self.exploring = False
+                self._cancel_current_goal()
+                self.navigating = False
+        finally:
+            self._record_callback_timing(
+                'resume_callback', time.perf_counter() - started)
+
+    def _record_timing(self, stage, duration_s):
+        """Accumulate stage timing stats for later logging."""
+        if not self.profile_timing:
+            return
+
+        self._timing_totals[stage] = self._timing_totals.get(stage, 0.0) + duration_s
+        self._timing_counts[stage] = self._timing_counts.get(stage, 0) + 1
+        self._timing_max[stage] = max(self._timing_max.get(stage, 0.0), duration_s)
+
+    def _maybe_log_timing(self):
+        """Periodically log average stage timings for recent planning cycles."""
+        if not self.profile_timing or not self._timing_totals:
+            return
+
+        now = time.perf_counter()
+        if now - self._timing_last_log < self.profile_log_interval:
+            return
+
+        total_time = self._timing_totals.get('plan_total', 0.0)
+        lines = [
+            f'Frontier timing over {self._timing_plan_counter} plans '
+            f'({self.profile_log_interval:.1f}s window):'
+        ]
+
+        for stage, total in sorted(
+                self._timing_totals.items(), key=lambda item: item[1], reverse=True):
+            count = self._timing_counts.get(stage, 1)
+            avg_ms = 1000.0 * total / max(count, 1)
+            max_ms = 1000.0 * self._timing_max.get(stage, 0.0)
+            share = (100.0 * total / total_time) if total_time > 0.0 else 0.0
+            lines.append(
+                f'  {stage}: avg={avg_ms:.1f}ms  max={max_ms:.1f}ms  share={share:.1f}%')
+
+        self.get_logger().info('\n'.join(lines))
+        self._timing_totals.clear()
+        self._timing_counts.clear()
+        self._timing_max.clear()
+        self._timing_last_log = now
+        self._timing_plan_counter = 0
+
+    def _record_callback_timing(self, callback_name, duration_s):
+        """Accumulate callback timing stats for later logging."""
+        if not self.profile_callbacks:
+            return
+
+        self._callback_totals[callback_name] = (
+            self._callback_totals.get(callback_name, 0.0) + duration_s)
+        self._callback_counts[callback_name] = (
+            self._callback_counts.get(callback_name, 0) + 1)
+        self._callback_max[callback_name] = max(
+            self._callback_max.get(callback_name, 0.0), duration_s)
+        self._maybe_log_callback_timing()
+
+    def _maybe_log_callback_timing(self):
+        """Periodically log per-callback rate and timing statistics."""
+        if not self.profile_callbacks or not self._callback_totals:
+            return
+
+        now = time.perf_counter()
+        window_s = now - self._callback_last_log
+        if window_s < self.profile_callback_log_interval:
+            return
+
+        total_callback_time = sum(self._callback_totals.values())
+        lines = [f'Frontier callback timing ({window_s:.1f}s window):']
+
+        for callback_name, total in sorted(
+                self._callback_totals.items(), key=lambda item: item[1], reverse=True):
+            count = self._callback_counts.get(callback_name, 1)
+            avg_ms = 1000.0 * total / max(count, 1)
+            max_ms = 1000.0 * self._callback_max.get(callback_name, 0.0)
+            rate_hz = count / max(window_s, 1e-6)
+            share = (100.0 * total / total_callback_time) if total_callback_time > 0.0 else 0.0
+            wall = 100.0 * total / max(window_s, 1e-6)
+            lines.append(
+                f'  {callback_name}: rate={rate_hz:.1f}Hz  avg={avg_ms:.3f}ms  '
+                f'max={max_ms:.3f}ms  share={share:.1f}%  wall={wall:.1f}%')
+
+        lines.append(
+            f'  callback_busy_total: {100.0 * total_callback_time / max(window_s, 1e-6):.1f}%')
+        self.get_logger().info('\n'.join(lines))
+        self._callback_totals.clear()
+        self._callback_counts.clear()
+        self._callback_max.clear()
+        self._callback_last_log = now
+
+    @staticmethod
+    def _normalize_frame_id(frame_id):
+        """Normalize ROS frame IDs for direct string comparison."""
+        return frame_id.lstrip('/') if frame_id else ''
+
+    @staticmethod
+    def _yaw_from_quaternion(quat):
+        """Return planar yaw from a quaternion."""
+        siny_cosp = 2.0 * (quat.w * quat.z + quat.x * quat.y)
+        cosy_cosp = 1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def _store_map_to_odom(self, tx, ty, yaw, stamp):
+        """Store the latest map->odom transform components."""
+        self._map_to_odom_xy = (float(tx), float(ty))
+        self._map_to_odom_yaw = float(yaw)
+        self._map_to_odom_stamp = stamp
+
+    def _update_robot_pose_cache(self):
+        """Compose cached map->odom and odom->base data into a map pose."""
+        if self._map_to_odom_xy is None or self._odom_pose_xy is None:
+            return
+
+        tx, ty = self._map_to_odom_xy
+        ox, oy = self._odom_pose_xy
+        cos_y = math.cos(self._map_to_odom_yaw)
+        sin_y = math.sin(self._map_to_odom_yaw)
+
+        self._robot_pose_xy = (
+            tx + cos_y * ox - sin_y * oy,
+            ty + sin_y * ox + cos_y * oy,
+        )
+        self._robot_pose_stamp = self._odom_stamp
+
+        if self.tf_sub is not None:
+            self.get_logger().info(
+                'Initial map pose cached; switching to odom-delta tracking')
+            self.destroy_subscription(self.tf_sub)
+            self.tf_sub = None
+
+    def _stamp_age_seconds(self, stamp):
+        """Return the age of a ROS stamp using the node's active clock."""
+        if stamp is None:
+            return float('inf')
+
+        now = self.get_clock().now()
+        if now.nanoseconds <= 0:
+            return 0.0
+
+        age_ns = (now - Time.from_msg(stamp)).nanoseconds
+        return max(0.0, age_ns / 1e9)
 
     # ================================================================
     # Main exploration loop
     # ================================================================
 
     def _explore_tick(self):
-        if not self.exploring:
-            return
+        started = time.perf_counter()
+        try:
+            if not self.exploring:
+                return
 
-        self._make_plan()
+            self._make_plan()
+        finally:
+            self._record_callback_timing(
+                'explore_tick', time.perf_counter() - started)
 
     def _make_plan(self):
         """Core planning: find frontiers from robot, pick best, navigate."""
@@ -191,8 +504,12 @@ class FrontierExplorerNode(Node):
             self.get_logger().info('Waiting for map...', throttle_duration_sec=5.0)
             return
 
+        plan_started = time.perf_counter()
+
         # 1. Get robot position in map frame
+        stage_started = time.perf_counter()
         robot_xy = self._get_robot_position()
+        self._record_timing('tf_lookup', time.perf_counter() - stage_started)
         if robot_xy is None:
             return
 
@@ -203,7 +520,9 @@ class FrontierExplorerNode(Node):
                 f'Initial pose stored: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})')
 
         # 2. Check navigation progress
+        stage_started = time.perf_counter()
         self._check_progress(robot_xy)
+        self._record_timing('progress_check', time.perf_counter() - stage_started)
 
         # If already navigating and making progress, do nothing
         if self.navigating:
@@ -211,10 +530,18 @@ class FrontierExplorerNode(Node):
 
         # 3. BFS frontier search from robot position
         info = self.map_data.info
-        map_array = np.array(self.map_data.data, dtype=np.int8).reshape(
-            (info.height, info.width))
+        map_array = self.map_array
+        if map_array is None:
+            self.get_logger().warning('Map array cache not ready yet')
+            return
 
-        frontiers = self._search_from(robot_xy, map_array, info)
+        stage_started = time.perf_counter()
+        dist_map = self._get_distance_transform(map_array)
+        self._record_timing('gvd_build', time.perf_counter() - stage_started)
+
+        stage_started = time.perf_counter()
+        frontiers = self._search_from(robot_xy, map_array, info, dist_map=dist_map)
+        self._record_timing('frontier_search', time.perf_counter() - stage_started)
 
         if not frontiers:
             self.get_logger().info(
@@ -248,25 +575,35 @@ class FrontierExplorerNode(Node):
 
         # 6. Visualise frontiers and GVD skeleton
         if self.visualize:
+            stage_started = time.perf_counter()
             self._publish_markers(valid, best)
+            self._record_timing('frontier_markers', time.perf_counter() - stage_started)
         if self.visualize_gvd:
+            stage_started = time.perf_counter()
             self._publish_gvd_markers(map_array, info)
+            self._record_timing('gvd_markers', time.perf_counter() - stage_started)
 
         # 7. Try to find a path along the GVD skeleton
+        stage_started = time.perf_counter()
         gvd_path = self._find_gvd_path(
             robot_xy, best.centroid, map_array, info)
+        self._record_timing('gvd_path_search', time.perf_counter() - stage_started)
 
         if gvd_path and len(gvd_path) >= 2:
             # GVD path found — sample waypoints and navigate through them
+            stage_started = time.perf_counter()
             waypoints = self._sample_waypoints(gvd_path, spacing=0.5)
+            self._record_timing('waypoint_sampling', time.perf_counter() - stage_started)
             gx, gy = waypoints[-1]
             self.get_logger().info(
                 f'GVD path found: {len(gvd_path)} cells → '
                 f'{len(waypoints)} waypoints')
         else:
             # Fallback: snap frontier goal to nearest GVD point
+            stage_started = time.perf_counter()
             gx, gy = self._snap_to_gvd(
                 best.centroid, robot_xy, map_array, info)
+            self._record_timing('gvd_snap_fallback', time.perf_counter() - stage_started)
             waypoints = None
             self.get_logger().info('No GVD path — using single goal fallback')
 
@@ -290,19 +627,32 @@ class FrontierExplorerNode(Node):
         # 10. Navigate
         self.current_frontier = best.centroid
         if waypoints and len(waypoints) >= 2:
+            stage_started = time.perf_counter()
             self._publish_path_markers(waypoints)
+            self._record_timing('path_markers', time.perf_counter() - stage_started)
+            stage_started = time.perf_counter()
             self._navigate_through_poses(waypoints)
+            self._record_timing('send_goal', time.perf_counter() - stage_started)
         else:
+            stage_started = time.perf_counter()
             self._navigate_to(gx, gy)
+            self._record_timing('send_goal', time.perf_counter() - stage_started)
+
+        self._record_timing('plan_total', time.perf_counter() - plan_started)
+        self._timing_plan_counter += 1
+        self._maybe_log_timing()
 
     # ================================================================
     # BFS frontier search from robot position
     # ================================================================
 
-    def _search_from(self, robot_xy, map_array, info):
+    def _search_from(self, robot_xy, map_array, info, dist_map=None):
         """
-        BFS outward from robot position to find frontiers.
-        Mirrors FrontierSearch::searchFrom from m-explore.
+        Find reachable frontiers from the robot position.
+
+        This keeps the original frontier semantics but replaces the Python
+        free-space / frontier BFS passes with connected-component operations
+        in ndimage, which are much cheaper on large grids.
         Returns list of Frontier objects sorted by cost.
         """
         resolution = info.resolution
@@ -327,142 +677,118 @@ class FrontierExplorerNode(Node):
                 return []
             mx, my = found
 
-        # State flags for each cell
-        # 0 = unvisited, 1 = in map-BFS queue, 2 = in map-BFS visited,
-        # 3 = in frontier-BFS queue, 4 = frontier-BFS done
-        MAP_OPEN = 1
-        MAP_CLOSED = 2
-        FRONTIER_OPEN = 3
-        FRONTIER_CLOSED = 4
+        frontier_mask = self._get_frontier_mask(map_array)
+        if not np.any(frontier_mask):
+            return []
 
-        state = np.zeros((h, w), dtype=np.uint8)
+        structure8 = np.ones((3, 3), dtype=np.uint8)
 
-        # BFS queue for the main map traversal
-        bfs_queue = deque()
-        bfs_queue.append((mx, my))
-        state[my, mx] = MAP_OPEN
+        # Reachability is determined from the robot's connected free-space
+        # component, then we keep frontier clusters touching that region.
+        free = (map_array == 0)
+        free_labels, _ = ndimage.label(free, structure=structure8)
+        reachable_label = int(free_labels[my, mx])
+        if reachable_label <= 0:
+            self.get_logger().warning('Robot free-space component not found')
+            return []
 
+        reachable_free = (free_labels == reachable_label)
+        frontier_labels, _ = ndimage.label(frontier_mask, structure=structure8)
+
+        touching_frontier = frontier_labels[
+            ndimage.binary_dilation(reachable_free, structure=structure8) & frontier_mask
+        ]
+        frontier_ids = np.unique(touching_frontier)
+        frontier_ids = frontier_ids[frontier_ids > 0]
+        if frontier_ids.size == 0:
+            return []
+
+        frontier_ys, frontier_xs = np.nonzero(frontier_labels)
+        all_labels = frontier_labels[frontier_ys, frontier_xs]
+        keep = np.isin(all_labels, frontier_ids)
+        if not np.any(keep):
+            return []
+
+        xs = frontier_xs[keep].astype(np.int32)
+        ys = frontier_ys[keep].astype(np.int32)
+        labels = all_labels[keep].astype(np.int32)
+
+        wx = xs * resolution + ox
+        wy = ys * resolution + oy
+        dists = np.hypot(wx - robot_xy[0], wy - robot_xy[1])
+
+        counts = np.bincount(labels)
+        sum_x = np.bincount(labels, weights=wx, minlength=counts.size)
+        sum_y = np.bincount(labels, weights=wy, minlength=counts.size)
+        min_dist = np.full(counts.size, np.inf, dtype=np.float64)
+        np.minimum.at(min_dist, labels, dists)
+
+        # Distance transform is used only for the clearance bonus term.
+        if dist_map is None:
+            dist_map = self._get_distance_transform(map_array)
         frontiers = []
 
-        # 8-connected neighbours
-        nbrs = [(-1, -1), (-1, 0), (-1, 1),
-                (0, -1),           (0, 1),
-                (1, -1),  (1, 0),  (1, 1)]
-
-        while bfs_queue:
-            cx, cy = bfs_queue.popleft()
-            if state[cy, cx] == MAP_CLOSED:
+        # Cost = min_distance - clearance_scale * clearance_at_centroid.
+        for label_id in frontier_ids.tolist():
+            size = int(counts[label_id])
+            if size < self.min_frontier_size:
                 continue
-            state[cy, cx] = MAP_CLOSED
 
-            # Check all 8 neighbours
-            for dx, dy in nbrs:
-                nx, ny = cx + dx, cy + dy
-                if nx < 0 or nx >= w or ny < 0 or ny >= h:
-                    continue
-
-                # Is this neighbour a new frontier cell?
-                if state[ny, nx] not in (FRONTIER_OPEN, FRONTIER_CLOSED):
-                    if self._is_frontier_cell(map_array, nx, ny, w, h, nbrs):
-                        # Build a new frontier starting from this cell
-                        frontier = self._build_frontier(
-                            map_array, state, nx, ny, w, h,
-                            robot_xy, ox, oy, resolution, nbrs,
-                            FRONTIER_OPEN, FRONTIER_CLOSED)
-                        if frontier.size >= self.min_frontier_size:
-                            frontiers.append(frontier)
-
-                # Enqueue free-space neighbours for continued map BFS
-                val = map_array[ny, nx]
-                if val == 0 and state[ny, nx] not in (MAP_OPEN, MAP_CLOSED):
-                    # Only expand through free space that neighbours
-                    # at least one unknown cell (to stay near boundaries)
-                    # OR free space (to traverse open areas)
-                    state[ny, nx] = MAP_OPEN
-                    bfs_queue.append((nx, ny))
-
-        # Compute distance transform for GVD clearance bonus
-        dist_map = self._get_distance_transform(map_array)
-
-        # Cost = min_distance - clearance_scale * clearance_at_centroid
-        # Primary: nearest first.  Secondary: prefer open-corridor frontiers.
-        for f in frontiers:
-            cx = int((f.centroid[0] - ox) / resolution)
-            cy = int((f.centroid[1] - oy) / resolution)
+            centroid_x = float(sum_x[label_id] / size)
+            centroid_y = float(sum_y[label_id] / size)
+            cx = int((centroid_x - ox) / resolution)
+            cy = int((centroid_y - oy) / resolution)
             cx = max(0, min(w - 1, cx))
             cy = max(0, min(h - 1, cy))
             clearance = float(dist_map[cy, cx]) * resolution  # metres
-            f.cost = f.min_distance - self.clearance_scale * clearance
+
+            frontier = Frontier()
+            frontier.size = size
+            frontier.min_distance = float(min_dist[label_id])
+            frontier.centroid = (centroid_x, centroid_y)
+            frontier.cost = frontier.min_distance - self.clearance_scale * clearance
+            frontiers.append(frontier)
 
         frontiers.sort(key=lambda f: f.cost)
         return frontiers
 
-    def _is_frontier_cell(self, map_array, x, y, w, h, nbrs):
-        """A frontier cell is unknown (-1) with at least one free (0) neighbour."""
-        if map_array[y, x] != -1:
-            return False
-        for dx, dy in nbrs:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                if map_array[ny, nx] == 0:
-                    return True
-        return False
+    def _get_frontier_mask(self, map_array):
+        """Return cached frontier-candidate mask for the current map."""
+        stamp = self.map_data.header.stamp if self.map_data else None
+        if (self._cached_frontier_mask is not None
+                and self._cached_frontier_stamp == stamp
+                and self._cached_frontier_mask.shape == map_array.shape):
+            return self._cached_frontier_mask
 
-    def _build_frontier(self, map_array, state, sx, sy, w, h,
-                        robot_xy, ox, oy, resolution, nbrs,
-                        FRONTIER_OPEN, FRONTIER_CLOSED):
-        """
-        BFS to collect all connected frontier cells from (sx, sy).
-        Computes centroid, min_distance, size etc.
-        """
-        frontier = Frontier()
-        fqueue = deque()
-        fqueue.append((sx, sy))
-        state[sy, sx] = FRONTIER_OPEN
+        free = (map_array == 0)
+        unknown = (map_array == -1)
+        h, w = map_array.shape
+        adjacent_free = np.zeros((h, w), dtype=bool)
 
-        sum_x = 0.0
-        sum_y = 0.0
-
-        while fqueue:
-            cx, cy = fqueue.popleft()
-            if state[cy, cx] == FRONTIER_CLOSED:
-                continue
-            state[cy, cx] = FRONTIER_CLOSED
-
-            # Convert to world coords
-            wx = cx * resolution + ox
-            wy = cy * resolution + oy
-
-            # Track min_distance — closest cell to robot
-            d = math.hypot(wx - robot_xy[0], wy - robot_xy[1])
-            if d < frontier.min_distance:
-                frontier.min_distance = d
-
-            sum_x += wx
-            sum_y += wy
-            frontier.points.append((wx, wy))
-
-            if frontier.size == 0:
-                frontier.initial = (wx, wy)
-
-            frontier.size += 1
-
-            # Expand to neighbouring frontier cells (8-connected)
-            for dx, dy in nbrs:
-                nx, ny = cx + dx, cy + dy
-                if nx < 0 or nx >= w or ny < 0 or ny >= h:
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
                     continue
-                if state[ny, nx] not in (FRONTIER_OPEN, FRONTIER_CLOSED):
-                    if self._is_frontier_cell(map_array, nx, ny, w, h, nbrs):
-                        state[ny, nx] = FRONTIER_OPEN
-                        fqueue.append((nx, ny))
 
-        if frontier.size > 0:
-            frontier.centroid = (sum_x / frontier.size, sum_y / frontier.size)
-            mid_idx = frontier.size // 2
-            frontier.middle = frontier.points[mid_idx]
+                if dy >= 0:
+                    src_y = slice(0, h - dy)
+                    dst_y = slice(dy, h)
+                else:
+                    src_y = slice(-dy, h)
+                    dst_y = slice(0, h + dy)
 
-        return frontier
+                if dx >= 0:
+                    src_x = slice(0, w - dx)
+                    dst_x = slice(dx, w)
+                else:
+                    src_x = slice(-dx, w)
+                    dst_x = slice(0, w + dx)
+
+                adjacent_free[dst_y, dst_x] |= free[src_y, src_x]
+
+        self._cached_frontier_mask = unknown & adjacent_free
+        self._cached_frontier_stamp = stamp
+        return self._cached_frontier_mask
 
     def _nearest_free_cell(self, map_array, sx, sy, w, h, max_radius=50):
         """Find nearest free cell to (sx, sy) via expanding square search."""
@@ -496,6 +822,8 @@ class FrontierExplorerNode(Node):
         self._cached_gvd_mask = self._extract_gvd_mask(
             self._cached_dist_map, self._cached_label_map, map_array)
         self._cached_map_stamp = stamp
+        self._cached_gvd_marker_array = None
+        self._cached_gvd_marker_stamp = None
         return self._cached_dist_map
 
     def _get_gvd_mask(self, map_array):
@@ -520,64 +848,22 @@ class FrontierExplorerNode(Node):
         """
         h, w = map_array.shape
         obstacle = map_array > 50  # only real obstacles, NOT unknown (-1)
+        if not np.any(obstacle):
+            return (np.zeros((h, w), dtype=np.float32),
+                    np.full((h, w), -1, dtype=np.int32))
 
-        # --- Phase 1: connected-component labeling of obstacle regions ---
-        region_id = np.full((h, w), -1, dtype=np.int32)
-        current_label = 0
-
-        for sy in range(h):
-            for sx in range(w):
-                if obstacle[sy, sx] and region_id[sy, sx] == -1:
-                    # BFS flood-fill this obstacle region (8-connected)
-                    cc_queue = deque()
-                    cc_queue.append((sx, sy))
-                    region_id[sy, sx] = current_label
-                    while cc_queue:
-                        cx, cy = cc_queue.popleft()
-                        for ddx in (-1, 0, 1):
-                            for ddy in (-1, 0, 1):
-                                if ddx == 0 and ddy == 0:
-                                    continue
-                                nx, ny = cx + ddx, cy + ddy
-                                if (0 <= nx < w and 0 <= ny < h
-                                        and obstacle[ny, nx]
-                                        and region_id[ny, nx] == -1):
-                                    region_id[ny, nx] = current_label
-                                    cc_queue.append((nx, ny))
-                    current_label += 1
-
+        region_id, num_regions = ndimage.label(
+            obstacle, structure=np.ones((3, 3), dtype=np.uint8))
         self.get_logger().debug(
-            f'GVD: found {current_label} obstacle regions',
+            f'GVD: found {num_regions} obstacle regions',
             throttle_duration_sec=10.0)
 
-        # --- Phase 2: BFS distance transform with region labels ---
-        dist = np.full((h, w), -1, dtype=np.int32)
-        label = np.full((h, w), -1, dtype=np.int32)
-        queue = deque()
+        dist, nearest_idx = ndimage.distance_transform_edt(
+            ~obstacle, return_indices=True)
+        nearest_y, nearest_x = nearest_idx
 
-        # Seed all obstacle cells with their region label
-        obs_y, obs_x = np.where(obstacle)
-        for i in range(len(obs_y)):
-            y, x = int(obs_y[i]), int(obs_x[i])
-            dist[y, x] = 0
-            label[y, x] = region_id[y, x]
-            queue.append((x, y))
-
-        # 4-connected BFS — propagate distance and region label
-        while queue:
-            cx, cy = queue.popleft()
-            nd = dist[cy, cx] + 1
-            lbl = label[cy, cx]
-            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + ddx, cy + ddy
-                if 0 <= nx < w and 0 <= ny < h and dist[ny, nx] == -1:
-                    dist[ny, nx] = nd
-                    label[ny, nx] = lbl
-                    queue.append((nx, ny))
-
-        # Cells still -1 (unreachable) get 0
-        dist[dist < 0] = 0
-        return dist, label
+        label = region_id[nearest_y, nearest_x].astype(np.int32) - 1
+        return dist.astype(np.float32), label
 
     def _extract_gvd_mask(self, dist_map, label_map, map_array):
         """
@@ -651,42 +937,24 @@ class FrontierExplorerNode(Node):
         robot_to_frontier = math.hypot(
             point[0] - robot_xy[0], point[1] - robot_xy[1])
 
-        # BFS outward from frontier centroid to find nearest GVD cell
         max_cells = int(self.gvd_snap_radius / resolution)
-        visited = set()
-        queue = deque()
-        queue.append((px, py))
-        visited.add((px, py))
+        xs, ys = self._window_true_coords(gvd_mask, px, py, max_cells)
+        if xs.size == 0:
+            self.get_logger().debug(
+                f'No valid GVD point within {self.gvd_snap_radius}m '
+                f'— using original centroid')
+            return point
 
-        best_gvd = None
-        best_dist = float('inf')
+        wx = xs * resolution + ox
+        wy = ys * resolution + oy
+        cand_to_robot = np.hypot(wx - robot_xy[0], wy - robot_xy[1])
+        cand_to_frontier = np.hypot(wx - point[0], wy - point[1])
+        valid = cand_to_robot < robot_to_frontier
 
-        while queue:
-            cx, cy = queue.popleft()
-            if gvd_mask[cy, cx]:
-                wx = cx * resolution + ox
-                wy = cy * resolution + oy
-                # Reject candidates that are farther from the frontier
-                # than the robot is (i.e. behind the robot)
-                cand_to_frontier = math.hypot(wx - point[0], wy - point[1])
-                if cand_to_frontier < best_dist:
-                    # Ensure candidate is not behind the robot:
-                    # candidate-to-frontier must be less than robot-to-frontier
-                    cand_to_robot = math.hypot(wx - robot_xy[0], wy - robot_xy[1])
-                    if cand_to_robot < robot_to_frontier:
-                        best_gvd = (wx, wy)
-                        best_dist = cand_to_frontier
-
-            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + ddx, cy + ddy
-                if (0 <= nx < w and 0 <= ny < h
-                        and (nx, ny) not in visited
-                        and abs(nx - px) <= max_cells
-                        and abs(ny - py) <= max_cells):
-                    visited.add((nx, ny))
-                    queue.append((nx, ny))
-
-        if best_gvd is not None:
+        if np.any(valid):
+            valid_idx = np.flatnonzero(valid)
+            best_idx = valid_idx[np.argmin(cand_to_frontier[valid])]
+            best_gvd = (float(wx[best_idx]), float(wy[best_idx]))
             self.get_logger().info(
                 f'Frontier snapped to GVD: '
                 f'({point[0]:.2f}, {point[1]:.2f}) -> '
@@ -702,8 +970,21 @@ class FrontierExplorerNode(Node):
     # GVD path planning (A* on skeleton)
     # ================================================================
 
+    def _window_true_coords(self, mask, px, py, max_cells):
+        """Return absolute coordinates of True cells in a square window."""
+        h, w = mask.shape
+        x0 = max(0, px - max_cells)
+        x1 = min(w, px + max_cells + 1)
+        y0 = max(0, py - max_cells)
+        y1 = min(h, py + max_cells + 1)
+
+        ys, xs = np.nonzero(mask[y0:y1, x0:x1])
+        if xs.size == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
+        return xs.astype(np.int32) + x0, ys.astype(np.int32) + y0
+
     def _nearest_gvd_cell(self, wx, wy, map_array, info, max_radius_m=1.5):
-        """Find nearest GVD cell to a world-coordinate point via BFS."""
+        """Find nearest GVD cell to a world-coordinate point in a local window."""
         gvd_mask = self._get_gvd_mask(map_array)
         if gvd_mask is None:
             return None
@@ -715,29 +996,30 @@ class FrontierExplorerNode(Node):
         if gvd_mask[py, px]:
             return (px, py)
         max_cells = int(max_radius_m / resolution)
-        visited = set()
-        queue = deque()
-        queue.append((px, py))
-        visited.add((px, py))
-        while queue:
-            cx, cy = queue.popleft()
-            if gvd_mask[cy, cx]:
-                return (cx, cy)
-            for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + ddx, cy + ddy
-                if (0 <= nx < w and 0 <= ny < h
-                        and (nx, ny) not in visited
-                        and abs(nx - px) <= max_cells
-                        and abs(ny - py) <= max_cells):
-                    visited.add((nx, ny))
-                    queue.append((nx, ny))
-        return None
+        xs, ys = self._window_true_coords(gvd_mask, px, py, max_cells)
+        if xs.size == 0:
+            return None
+        dist2 = (xs - px) ** 2 + (ys - py) ** 2
+        best = int(np.argmin(dist2))
+        return (int(xs[best]), int(ys[best]))
+
+    def _iter_gvd_neighbors(self, x, y, gvd_mask):
+        """Yield 8-connected neighbors that remain on the GVD skeleton."""
+        h, w = gvd_mask.shape
+        sqrt2 = math.sqrt(2)
+        for ddx, ddy in ((-1, -1), (-1, 0), (-1, 1),
+                         (0, -1),           (0, 1),
+                         (1, -1),  (1, 0),  (1, 1)):
+            nx, ny = x + ddx, y + ddy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            if not gvd_mask[ny, nx]:
+                continue
+            yield nx, ny, (sqrt2 if (ddx != 0 and ddy != 0) else 1.0)
 
     def _find_gvd_path(self, robot_xy, goal_xy, map_array, info):
         """
-        A* search from robot to goal, strongly preferring GVD skeleton cells.
-        Non-GVD free cells are traversable but with a heavy penalty, so the
-        path sticks to the skeleton but can bridge gaps where needed.
+        A* search from robot to goal on the GVD skeleton only.
         Returns list of (wx, wy) world-coordinate waypoints, or None.
         """
         gvd_mask = self._get_gvd_mask(map_array)
@@ -759,12 +1041,7 @@ class FrontierExplorerNode(Node):
 
         resolution = info.resolution
         ox, oy = info.origin.position.x, info.origin.position.y
-        w, h = info.width, info.height
 
-        # A* on free cells (8-connected), GVD cells preferred
-        # GVD cell cost = 1.0, non-GVD free cell cost = 5.0 (penalty)
-        SQRT2 = math.sqrt(2)
-        OFF_GVD_PENALTY = 5.0
         counter = 0
         open_set = []
         heapq.heappush(open_set, (0.0, counter, start))
@@ -796,22 +1073,8 @@ class FrontierExplorerNode(Node):
                     f'({100*gvd_count//len(path)}%)')
                 return world_path
 
-            for ddx, ddy in ((-1, -1), (-1, 0), (-1, 1),
-                             (0, -1),           (0, 1),
-                             (1, -1),  (1, 0),  (1, 1)):
-                nx, ny = cx + ddx, cy + ddy
-                if not (0 <= nx < w and 0 <= ny < h):
-                    continue
-                # Must be free cell (occupancy == 0)
-                if map_array[ny, nx] != 0:
-                    continue
-
-                diag = 1 if (ddx != 0 and ddy != 0) else 0
-                base_cost = SQRT2 if diag else 1.0
-                # Heavy penalty for leaving the skeleton
-                if not gvd_mask[ny, nx]:
-                    base_cost *= OFF_GVD_PENALTY
-                tentative_g = g_score[current] + base_cost
+            for nx, ny, step_cost in self._iter_gvd_neighbors(cx, cy, gvd_mask):
+                tentative_g = g_score[current] + step_cost
                 neighbor = (nx, ny)
 
                 if tentative_g < g_score.get(neighbor, float('inf')):
@@ -875,7 +1138,8 @@ class FrontierExplorerNode(Node):
         seq = self._goal_seq
         self.get_logger().info(f'Sending goal: ({x:.2f}, {y:.2f})')
 
-        send_future = self.nav_client.send_goal_async(nav_goal)
+        send_future = self.nav_client.send_goal_async(
+            nav_goal, feedback_callback=self._nav_feedback_cb)
         send_future.add_done_callback(
             lambda f, s=seq: self._goal_response_cb(f, s))
 
@@ -913,7 +1177,8 @@ class FrontierExplorerNode(Node):
             f'Navigating through {len(waypoints)} GVD waypoints '
             f'→ ({last[0]:.2f}, {last[1]:.2f})')
 
-        send_future = self.nav_through_client.send_goal_async(nav_goal)
+        send_future = self.nav_through_client.send_goal_async(
+            nav_goal, feedback_callback=self._nav_feedback_cb)
         send_future.add_done_callback(
             lambda f, s=seq: self._goal_response_cb(f, s))
 
@@ -924,65 +1189,68 @@ class FrontierExplorerNode(Node):
         self.last_robot_pos = self._get_robot_position()
 
     def _goal_response_cb(self, future, seq):
-        # Ignore stale callback from a superseded goal
-        if seq != self._goal_seq:
-            return
+        started = time.perf_counter()
+        try:
+            # Ignore stale callback from a superseded goal
+            if seq != self._goal_seq:
+                return
 
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warning('Goal rejected by Nav2')
-            self._blacklist_current_goal()
-            self.navigating = False
-            self.prev_goal = None
-            # Immediate replan
-            self._make_plan()
-            return
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.get_logger().warning(
+                    'Goal rejected by Nav2; keeping frontier and waiting for next planner tick')
+                self.navigating = False
+                self.prev_goal = None
+                return
 
-        self.get_logger().info('Goal accepted')
-        self.goal_handle = goal_handle
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda f, s=seq: self._navigation_result_cb(f, s))
+            self.get_logger().info('Goal accepted')
+            self.goal_handle = goal_handle
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(
+                lambda f, s=seq: self._navigation_result_cb(f, s))
+        finally:
+            self._record_callback_timing(
+                'goal_response_cb', time.perf_counter() - started)
 
     def _navigation_result_cb(self, future, seq):
-        """Handle navigation result — then immediately replan."""
-        # Ignore stale callback from a superseded goal
-        if seq != self._goal_seq:
-            self.get_logger().debug(
-                f'Ignoring stale result callback (seq {seq}, current {self._goal_seq})')
-            return
-
+        """Handle navigation result and return control to the timer loop."""
+        started = time.perf_counter()
         try:
-            status = future.result().status
-            # 4 = SUCCEEDED, 5 = CANCELED, 6 = ABORTED
-            if status == 4:
-                self.get_logger().info('Navigation succeeded')
-                # Always blacklist the frontier centroid after success.
-                # If the frontier was truly explored, it vanishes from
-                # BFS naturally and the blacklist entry is harmless.
-                # If Nav2 "succeeded" via goal tolerance without actually
-                # reaching it, the blacklist prevents an infinite loop.
-                if self.current_frontier is not None:
-                    self._blacklist_point(
-                        self.current_frontier[0], self.current_frontier[1])
-            elif status == 6:
-                self.get_logger().warning('Navigation aborted — blacklisting goal')
-                self._blacklist_current_goal()
-            elif status == 5:
-                self.get_logger().info('Navigation cancelled')
-            else:
-                self.get_logger().warning(f'Navigation ended with status {status}')
-        except Exception as e:
-            self.get_logger().error(f'Navigation result error: {e}')
-            self._blacklist_current_goal()
+            # Ignore stale callback from a superseded goal
+            if seq != self._goal_seq:
+                self.get_logger().debug(
+                    f'Ignoring stale result callback (seq {seq}, current {self._goal_seq})')
+                return
 
-        self.navigating = False
-        self.goal_handle = None
-        self.prev_goal = None   # allow re-selecting same frontier if it persists
+            try:
+                status = future.result().status
+                # 4 = SUCCEEDED, 5 = CANCELED, 6 = ABORTED
+                if status == 4:
+                    self.get_logger().info('Navigation succeeded')
+                    # Always blacklist the frontier centroid after success.
+                    # If the frontier was truly explored, it vanishes from
+                    # BFS naturally and the blacklist entry is harmless.
+                    # If Nav2 "succeeded" via goal tolerance without actually
+                    # reaching it, the blacklist prevents an infinite loop.
+                    if self.current_frontier is not None:
+                        self._blacklist_point(
+                            self.current_frontier[0], self.current_frontier[1])
+                elif status == 6:
+                    self.get_logger().warning(
+                        'Navigation aborted by Nav2; keeping frontier and waiting for next planner tick')
+                elif status == 5:
+                    self.get_logger().info('Navigation cancelled')
+                else:
+                    self.get_logger().warning(f'Navigation ended with status {status}')
+            except Exception as e:
+                self.get_logger().error(f'Navigation result error: {e}')
 
-        # Immediate replan (like reachedGoal -> makePlan in m-explore)
-        if self.exploring:
-            self._make_plan()
+            self.navigating = False
+            self.goal_handle = None
+            self.prev_goal = None   # allow re-selecting same frontier if it persists
+        finally:
+            self._record_callback_timing(
+                'navigation_result_cb', time.perf_counter() - started)
 
     def _return_to_initial_pose(self):
         """Navigate back to the pose where the robot started."""
@@ -1050,20 +1318,29 @@ class FrontierExplorerNode(Node):
     # ================================================================
 
     def _get_robot_position(self):
-        """Get robot (x, y) in map frame via TF."""
-        try:
-            t = self.tf_buffer.lookup_transform(
-                self.global_frame,
-                self.robot_base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=self.tf_tolerance))
-            return (t.transform.translation.x, t.transform.translation.y)
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
+        """Get robot (x, y) in map frame from cached odom and map->odom."""
+        if self._robot_pose_xy is None:
             self.get_logger().warning(
-                f'TF lookup failed: {e}', throttle_duration_sec=5.0)
+                'Robot pose cache not ready yet',
+                throttle_duration_sec=5.0)
             return None
+
+        if self._using_nav_feedback_pose:
+            pose_age = self._stamp_age_seconds(self._robot_pose_stamp)
+            if self.navigating and pose_age > self.tf_tolerance:
+                self.get_logger().warning(
+                    f'Nav2 feedback pose is stale ({pose_age:.2f}s old)',
+                    throttle_duration_sec=5.0)
+            return self._robot_pose_xy
+
+        odom_age = self._stamp_age_seconds(self._odom_stamp)
+        if odom_age > self.tf_tolerance:
+            self.get_logger().warning(
+                f'Odom pose is stale ({odom_age:.2f}s old)',
+                throttle_duration_sec=5.0)
+            return None
+
+        return self._robot_pose_xy
 
     # ================================================================
     # Visualisation
@@ -1125,6 +1402,16 @@ class FrontierExplorerNode(Node):
 
     def _publish_gvd_markers(self, map_array, info):
         """Publish GVD skeleton as connected LINE_LIST markers."""
+        self._gvd_marker_publish_counter += 1
+        if ((self._gvd_marker_publish_counter - 1) % self.gvd_marker_publish_every) != 0:
+            return
+
+        stamp = self.map_data.header.stamp if self.map_data else None
+        if (self._cached_gvd_marker_array is not None
+                and self._cached_gvd_marker_stamp == stamp):
+            self.gvd_marker_pub.publish(self._cached_gvd_marker_array)
+            return
+
         gvd_mask = self._get_gvd_mask(map_array)
         if gvd_mask is None:
             return
@@ -1132,7 +1419,6 @@ class FrontierExplorerNode(Node):
         resolution = info.resolution
         ox = info.origin.position.x
         oy = info.origin.position.y
-        h, w = gvd_mask.shape
 
         ma = MarkerArray()
 
@@ -1155,43 +1441,40 @@ class FrontierExplorerNode(Node):
         line_marker.color.g = 1.0
         line_marker.color.b = 1.0
         line_marker.color.a = 0.8
-        line_marker.lifetime.sec = 10
+        line_marker.lifetime.sec = 0
         line_marker.pose.orientation.w = 1.0
 
-        # 4-connected: only check right and down to avoid duplicate edges
-        gvd_ys, gvd_xs = np.where(gvd_mask)
-        gvd_set = set(zip(gvd_xs.tolist(), gvd_ys.tolist()))
+        edge_masks = (
+            (gvd_mask[:, :-1] & gvd_mask[:, 1:], 0, 0, 1, 0),
+            (gvd_mask[:-1, :] & gvd_mask[1:, :], 0, 0, 0, 1),
+            (gvd_mask[:-1, :-1] & gvd_mask[1:, 1:], 0, 0, 1, 1),
+            (gvd_mask[1:, :-1] & gvd_mask[:-1, 1:], 0, 1, 1, -1),
+        )
 
-        for x, y in gvd_set:
-            wx = x * resolution + ox
-            wy = y * resolution + oy
-            p1 = Point(x=wx, y=wy, z=0.05)
-            # Check right neighbor
-            if (x + 1, y) in gvd_set:
-                p2 = Point(x=(x + 1) * resolution + ox, y=wy, z=0.05)
-                line_marker.points.append(p1)
-                line_marker.points.append(p2)
-            # Check down neighbor
-            if (x, y + 1) in gvd_set:
-                p2 = Point(x=wx, y=(y + 1) * resolution + oy, z=0.05)
-                line_marker.points.append(p1)
-                line_marker.points.append(p2)
-            # Check diagonal right-down
-            if (x + 1, y + 1) in gvd_set:
-                p2 = Point(x=(x + 1) * resolution + ox,
-                           y=(y + 1) * resolution + oy, z=0.05)
-                line_marker.points.append(p1)
-                line_marker.points.append(p2)
-            # Check diagonal right-up
-            if (x + 1, y - 1) in gvd_set:
-                p2 = Point(x=(x + 1) * resolution + ox,
-                           y=(y - 1) * resolution + oy, z=0.05)
+        for edge_mask, x_off, y_off, dx, dy in edge_masks:
+            ys, xs = np.nonzero(edge_mask)
+            if self.gvd_marker_stride > 1:
+                xs = xs[::self.gvd_marker_stride]
+                ys = ys[::self.gvd_marker_stride]
+            for x, y in zip(xs.tolist(), ys.tolist()):
+                x0 = x + x_off
+                y0 = y + y_off
+                p1 = Point(
+                    x=x0 * resolution + ox,
+                    y=y0 * resolution + oy,
+                    z=0.05)
+                p2 = Point(
+                    x=(x0 + dx) * resolution + ox,
+                    y=(y0 + dy) * resolution + oy,
+                    z=0.05)
                 line_marker.points.append(p1)
                 line_marker.points.append(p2)
 
         if line_marker.points:
             ma.markers.append(line_marker)
 
+        self._cached_gvd_marker_array = ma
+        self._cached_gvd_marker_stamp = stamp
         self.gvd_marker_pub.publish(ma)
 
     def _publish_markers(self, frontiers, chosen):

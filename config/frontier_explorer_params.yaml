@@ -19,6 +19,8 @@ frontier_explorer:
 
     # TF frames
     robot_base_frame: base_link
+    odom_frame: odom
+    odom_topic: /odom
     global_frame: map
 
     # TF lookup tolerance (seconds)
@@ -66,3 +68,8 @@ frontier_explorer:
 
     # Publish GVD skeleton as LINE_LIST markers on /explore/gvd
     visualize_gvd: true
+
+    # Publish/stride controls added in the optimized explorer implementation.
+    # These reduce marker publication load while preserving visualization.
+    gvd_marker_publish_every: 3
+    gvd_marker_stride: 2

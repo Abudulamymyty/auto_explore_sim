@@ -65,7 +65,13 @@ controller_server:
     # MPPI (Model Predictive Path Integral) controller
     # Samples thousands of trajectories and picks the lowest-cost one
     FollowPath:
-      plugin: "nav2_mppi_controller::MPPIController"
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "nav2_mppi_controller::MPPIController"
+      angular_dist_threshold: 0.20
+      forward_sampling_distance: 0.5
+      rotate_to_heading_angular_vel: 1.8
+      max_angular_accel: 3.2
+      simulate_ahead_time: 1.0
       time_steps: 48                        # Shorter horizon for quicker local reaction
       model_dt: 0.04                        # 48*0.04 = 1.92s lookahead
       batch_size: 1000                      # Number of sampled trajectories per iteration
@@ -225,7 +231,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0            # Moderate decay — gradient extends further
-        inflation_radius: 0.40              # MPPI sees walls from 0.40m away
+        inflation_radius: 0.1              # MPPI sees walls from 0.40m away
       always_send_full_costmap: True
 
 # -----------------------------------------------------------------------------
@@ -280,7 +286,7 @@ global_costmap:
         cost_scaling_factor: 4.0
         # 0.40m > robot_radius (0.22m) → guaranteed gradient zone around all obstacles.
         # Doorway (0.8m): 0.8 - 2*0.22 = 0.36m clearance, within inflation but plannable.
-        inflation_radius: 0.20
+        inflation_radius: 0.2
 
       always_send_full_costmap: True
 
