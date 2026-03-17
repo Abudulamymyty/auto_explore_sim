@@ -86,6 +86,24 @@ Visualization Manager:
       Line Style:
         Value: Lines
 
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Frontiers
+      Enabled: true
+      Topic:
+        Value: /explore/frontiers
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: GVD Skeleton
+      Enabled: true
+      Topic:
+        Value: /explore/gvd
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: GVD Path
+      Enabled: true
+      Topic:
+        Value: /explore/gvd_path
+
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select

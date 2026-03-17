@@ -29,6 +29,14 @@ bt_navigator:
       - compute_path_error_code
       - follow_path_error_code
 
+bt_navigator_navigate_through_poses_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+
+bt_navigator_navigate_to_pose_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+
 # -----------------------------------------------------------------------------
 # Controller Server (MPPI)
 # Computes velocity commands to follow the global path

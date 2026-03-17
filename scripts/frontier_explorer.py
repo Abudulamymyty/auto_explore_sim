@@ -69,6 +69,9 @@ class FrontierExplorerNode(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('global_frame', 'map')
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('live_map_ready_topic', '/map_live_ready')
+        self.declare_parameter('require_live_map', False)
         self.declare_parameter('transform_tolerance', 2.0)
         self.declare_parameter('blacklist_radius', 0.5)          # metres
         self.declare_parameter('blacklist_timeout', 60.0)        # seconds
@@ -94,6 +97,9 @@ class FrontierExplorerNode(Node):
         self.odom_frame = self.get_parameter('odom_frame').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.global_frame = self.get_parameter('global_frame').value
+        self.map_topic = self.get_parameter('map_topic').value
+        self.live_map_ready_topic = self.get_parameter('live_map_ready_topic').value
+        self.require_live_map = self.get_parameter('require_live_map').value
         self.tf_tolerance = self.get_parameter('transform_tolerance').value
         self.blacklist_radius = self.get_parameter('blacklist_radius').value
         self.blacklist_timeout = self.get_parameter('blacklist_timeout').value
@@ -122,15 +128,32 @@ class FrontierExplorerNode(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        tf_static_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=100,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self.map_data = None
         self.map_array = None
+        self._live_map_ready = False
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self._map_callback, 10)
+            OccupancyGrid, self.map_topic, self._map_callback, map_qos)
+        self.live_map_ready_sub = self.create_subscription(
+            Bool, self.live_map_ready_topic, self._live_map_ready_callback, map_qos)
         self.odom_sub = self.create_subscription(
             Odometry, self.odom_topic, self._odom_callback, 20)
         self.tf_sub = self.create_subscription(
             TFMessage, '/tf', self._tf_callback, tf_qos)
+        self.tf_static_sub = self.create_subscription(
+            TFMessage, '/tf_static', self._tf_callback, tf_static_qos)
 
         # Stop / resume subscription
         self.exploring = True
@@ -202,6 +225,7 @@ class FrontierExplorerNode(Node):
             f'Frontier Explorer ready  (freq={self.planner_freq} Hz, '
             f'min_frontier={self.min_frontier_size} cells, '
             f'clearance_scale={self.clearance_scale}, '
+            f'map_topic={self.map_topic}, '
             f'gvd_snap_radius={self.gvd_snap_radius}m, '
             f'gvd_marker_every={self.gvd_marker_publish_every}, '
             f'gvd_marker_stride={self.gvd_marker_stride}, '
@@ -216,6 +240,11 @@ class FrontierExplorerNode(Node):
         started = time.perf_counter()
         try:
             self.map_data = msg
+            if not self._live_map_ready:
+                self._live_map_ready = True
+                self.get_logger().info(
+                    'Received live map data directly from the map topic; '
+                    'marking live map as ready.')
             info = msg.info
             self.map_array = np.asarray(msg.data, dtype=np.int8).reshape(
                 (info.height, info.width))
@@ -245,7 +274,7 @@ class FrontierExplorerNode(Node):
 
             # After initial map pose bootstrap, integrate odom deltas directly
             # instead of processing the full TF stream continuously.
-            if (self.tf_sub is None
+            if (self.tf_sub is None and self.tf_static_sub is None
                     and prev_odom_xy is not None
                     and self._robot_pose_xy is not None
                     and self._map_to_odom_yaw is not None):
@@ -344,6 +373,9 @@ class FrontierExplorerNode(Node):
         finally:
             self._record_callback_timing(
                 'resume_callback', time.perf_counter() - started)
+
+    def _live_map_ready_callback(self, msg: Bool):
+        self._live_map_ready = bool(msg.data)
 
     def _record_timing(self, stage, duration_s):
         """Accumulate stage timing stats for later logging."""
@@ -465,11 +497,15 @@ class FrontierExplorerNode(Node):
         )
         self._robot_pose_stamp = self._odom_stamp
 
-        if self.tf_sub is not None:
+        if self.tf_sub is not None or self.tf_static_sub is not None:
             self.get_logger().info(
                 'Initial map pose cached; switching to odom-delta tracking')
-            self.destroy_subscription(self.tf_sub)
-            self.tf_sub = None
+            if self.tf_sub is not None:
+                self.destroy_subscription(self.tf_sub)
+                self.tf_sub = None
+            if self.tf_static_sub is not None:
+                self.destroy_subscription(self.tf_static_sub)
+                self.tf_static_sub = None
 
     def _stamp_age_seconds(self, stamp):
         """Return the age of a ROS stamp using the node's active clock."""
@@ -502,6 +538,11 @@ class FrontierExplorerNode(Node):
         """Core planning: find frontiers from robot, pick best, navigate."""
         if self.map_data is None:
             self.get_logger().info('Waiting for map...', throttle_duration_sec=5.0)
+            return
+        if self.require_live_map and not self._live_map_ready:
+            self.get_logger().info(
+                'Waiting for live map update from the current SLAM session...',
+                throttle_duration_sec=5.0)
             return
 
         plan_started = time.perf_counter()

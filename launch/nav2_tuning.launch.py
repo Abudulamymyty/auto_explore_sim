@@ -9,6 +9,7 @@ Usage:
   ros2 launch auto_explore_sim nav2_tuning.launch.py
   ros2 launch auto_explore_sim nav2_tuning.launch.py headless:=true
   ros2 launch auto_explore_sim nav2_tuning.launch.py nav2_params_file:=/absolute/path/to/custom_params.yaml
+  ros2 launch auto_explore_sim nav2_tuning.launch.py rviz_config:=/absolute/path/to/custom.rviz
 """
 
 import os
@@ -22,6 +23,7 @@ from launch.actions import (
     GroupAction,
     IncludeLaunchDescription,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -35,7 +37,6 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     # ── Package directories ──────────────────────────────────────────────
     pkg_dir = get_package_share_directory('auto_explore_sim')
-    nav2_bringup_dir = get_package_share_directory('nav2_bringup')
     slam_toolbox_dir = get_package_share_directory('slam_toolbox')
     sim_dir = get_package_share_directory('nav2_minimal_tb3_sim')
 
@@ -45,6 +46,7 @@ def generate_launch_description():
     headless = LaunchConfiguration('headless')
     nav2_params_file = LaunchConfiguration('nav2_params_file')
     slam_params_file = LaunchConfiguration('slam_params_file')
+    rviz_config = LaunchConfiguration('rviz_config')
 
     # ── Declare launch arguments ─────────────────────────────────────────
     declare_use_sim_time = DeclareLaunchArgument(
@@ -71,11 +73,16 @@ def generate_launch_description():
 
     # ── File paths ───────────────────────────────────────────────────────
     world_file = os.path.join(pkg_dir, 'worlds', 'office.sdf')
-    rviz_config_file = os.path.join(pkg_dir, 'rviz', 'nav2_tuning.rviz')
+    default_rviz_config = os.path.join(pkg_dir, 'rviz', 'nav2_tuning.rviz')
 
     # Fallback to explore.rviz if the tuning rviz config doesn't exist yet
-    if not os.path.isfile(rviz_config_file):
-        rviz_config_file = os.path.join(pkg_dir, 'rviz', 'explore.rviz')
+    if not os.path.isfile(default_rviz_config):
+        default_rviz_config = os.path.join(pkg_dir, 'rviz', 'explore.rviz')
+
+    declare_rviz_config = DeclareLaunchArgument(
+        'rviz_config',
+        default_value=default_rviz_config,
+        description='RViz config file')
 
     # ── Nav2 params with substitutions ───────────────────────────────────
     configured_params = ParameterFile(
@@ -246,7 +253,7 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='screen',
-        arguments=['-d', rviz_config_file],
+        arguments=['-d', rviz_config],
         parameters=[{'use_sim_time': use_sim_time}],
         condition=IfCondition(use_rviz),
     )
@@ -262,6 +269,7 @@ def generate_launch_description():
     ld.add_action(declare_headless)
     ld.add_action(declare_nav2_params)
     ld.add_action(declare_slam_params)
+    ld.add_action(declare_rviz_config)
 
     # Start simulation
     ld.add_action(gazebo_server)
@@ -271,11 +279,17 @@ def generate_launch_description():
     # Start robot description
     ld.add_action(robot_state_publisher)
 
-    # Start SLAM
-    ld.add_action(slam_toolbox)
-
-    # Start Nav2 (NO explore_lite — set goals manually in RViz)
-    ld.add_action(nav2_nodes)
+    # Delay SLAM/Nav2 bringup until the Gazebo bridges have had time to publish
+    # /tf and /odom; otherwise Nav2 activates before the map/odom frames exist.
+    ld.add_action(
+        TimerAction(
+            period=5.0,
+            actions=[
+                slam_toolbox,
+                nav2_nodes,
+            ],
+        )
+    )
 
     # Start visualization
     ld.add_action(rviz_node)

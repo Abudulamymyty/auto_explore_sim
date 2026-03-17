@@ -61,6 +61,22 @@ struct IndexedCost
   }
 };
 
+struct SiteWavefront
+{
+  double cost;
+  int counter;
+  int index;
+  int seed_id;
+
+  bool operator<(const SiteWavefront & other) const
+  {
+    if (cost != other.cost) {
+      return cost > other.cost;
+    }
+    return counter > other.counter;
+  }
+};
+
 inline bool same_stamp(
   const builtin_interfaces::msg::Time & a,
   const builtin_interfaces::msg::Time & b)
@@ -76,6 +92,8 @@ inline geometry_msgs::msg::Point make_point(double x, double y, double z)
   point.z = z;
   return point;
 }
+
+constexpr double kOffGvdPenalty = 4.0;
 }  // namespace
 
 class FrontierExplorerNode : public rclcpp::Node
@@ -95,6 +113,9 @@ public:
     declare_parameter("odom_frame", "odom");
     declare_parameter("odom_topic", "/odom");
     declare_parameter("global_frame", "map");
+    declare_parameter("map_topic", "/map");
+    declare_parameter("live_map_ready_topic", "/map_live_ready");
+    declare_parameter("require_live_map", false);
     declare_parameter("transform_tolerance", 2.0);
     declare_parameter("blacklist_radius", 0.5);
     declare_parameter("blacklist_timeout", 60.0);
@@ -118,6 +139,9 @@ public:
     odom_frame_ = get_parameter("odom_frame").as_string();
     odom_topic_ = get_parameter("odom_topic").as_string();
     global_frame_ = get_parameter("global_frame").as_string();
+    map_topic_ = get_parameter("map_topic").as_string();
+    live_map_ready_topic_ = get_parameter("live_map_ready_topic").as_string();
+    require_live_map_ = get_parameter("require_live_map").as_bool();
     tf_tolerance_ = get_parameter("transform_tolerance").as_double();
     blacklist_radius_ = get_parameter("blacklist_radius").as_double();
     blacklist_timeout_ = get_parameter("blacklist_timeout").as_double();
@@ -141,15 +165,27 @@ public:
     rclcpp::QoS tf_qos(rclcpp::KeepLast(100));
     tf_qos.best_effort();
     tf_qos.durability_volatile();
+    rclcpp::QoS tf_static_qos(rclcpp::KeepLast(100));
+    tf_static_qos.reliable();
+    tf_static_qos.transient_local();
+    rclcpp::QoS map_qos(rclcpp::KeepLast(1));
+    map_qos.reliable();
+    map_qos.transient_local();
 
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-      "/map", 10,
+      map_topic_, map_qos,
       std::bind(&FrontierExplorerNode::map_callback, this, std::placeholders::_1));
+    live_map_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+      live_map_ready_topic_, map_qos,
+      std::bind(&FrontierExplorerNode::live_map_ready_callback, this, std::placeholders::_1));
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, 20,
       std::bind(&FrontierExplorerNode::odom_callback, this, std::placeholders::_1));
     tf_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
       "/tf", tf_qos,
+      std::bind(&FrontierExplorerNode::tf_callback, this, std::placeholders::_1));
+    tf_static_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
+      "/tf_static", tf_static_qos,
       std::bind(&FrontierExplorerNode::tf_callback, this, std::placeholders::_1));
     resume_sub_ = create_subscription<std_msgs::msg::Bool>(
       "explore/resume", 10,
@@ -179,8 +215,8 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Frontier Explorer C++ ready (freq=%.2f Hz, min_frontier=%d cells, clearance_scale=%.2f, "
-      "gvd_snap_radius=%.2fm, gvd_marker_every=%d, gvd_marker_stride=%d)",
-      planner_freq_, min_frontier_size_, clearance_scale_, gvd_snap_radius_,
+      "map_topic=%s, gvd_snap_radius=%.2fm, gvd_marker_every=%d, gvd_marker_stride=%d)",
+      planner_freq_, min_frontier_size_, clearance_scale_, map_topic_.c_str(), gvd_snap_radius_,
       gvd_marker_publish_every_, gvd_marker_stride_);
   }
 
@@ -191,6 +227,12 @@ private:
   {
     auto started = Clock::now();
     map_msg_ = msg;
+    if (!live_map_ready_) {
+      live_map_ready_ = true;
+      RCLCPP_INFO(
+        get_logger(),
+        "Received live map data directly from the map topic; marking live map as ready");
+    }
     width_ = static_cast<int>(msg->info.width);
     height_ = static_cast<int>(msg->info.height);
     resolution_ = msg->info.resolution;
@@ -219,7 +261,7 @@ private:
     odom_pose_ = std::make_pair(msg->pose.pose.position.x, msg->pose.pose.position.y);
     odom_stamp_ = msg->header.stamp;
 
-    if (!tf_sub_ && prev_odom_pose && robot_pose_ && map_to_odom_yaw_) {
+    if (!tf_sub_ && !tf_static_sub_ && prev_odom_pose && robot_pose_ && map_to_odom_yaw_) {
       const double dx = odom_pose_->first - prev_odom_pose->first;
       const double dy = odom_pose_->second - prev_odom_pose->second;
       const double cos_y = std::cos(*map_to_odom_yaw_);
@@ -285,6 +327,11 @@ private:
     record_callback_timing("resume_callback", started);
   }
 
+  void live_map_ready_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    live_map_ready_ = msg->data;
+  }
+
   void nav_feedback_cb(const geometry_msgs::msg::PoseStamped & current_pose)
   {
     auto started = Clock::now();
@@ -324,6 +371,12 @@ private:
   {
     if (!map_msg_) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Waiting for map...");
+      return;
+    }
+    if (require_live_map_ && !live_map_ready_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Waiting for live map update from the current SLAM session...");
       return;
     }
 
@@ -395,28 +448,33 @@ private:
     auto gvd_started = Clock::now();
     auto gvd_path = find_gvd_path(*robot_xy, {best.centroid_x, best.centroid_y});
     record_timing("gvd_path_search", gvd_started);
-
-    std::optional<std::vector<std::pair<double, double>>> waypoints;
-    double gx = best.centroid_x;
-    double gy = best.centroid_y;
-    if (gvd_path && gvd_path->size() >= 2U) {
-      auto waypoint_started = Clock::now();
-      waypoints = sample_waypoints(*gvd_path, 0.5);
-      record_timing("waypoint_sampling", waypoint_started);
-      gx = waypoints->back().first;
-      gy = waypoints->back().second;
-      RCLCPP_INFO(
-        get_logger(), "GVD path found: %zu cells -> %zu waypoints",
-        gvd_path->size(), waypoints->size());
-    } else {
-      auto snap_started = Clock::now();
-      const auto snapped = snap_to_gvd(
-        {best.centroid_x, best.centroid_y}, *robot_xy);
-      record_timing("gvd_snap_fallback", snap_started);
-      gx = snapped.first;
-      gy = snapped.second;
-      RCLCPP_INFO(get_logger(), "No GVD path - using single goal fallback");
+    if (!gvd_path || gvd_path->size() < 2U) {
+      RCLCPP_WARN(
+        get_logger(),
+        "No GVD-guided waypoint path to frontier (%.2f, %.2f); blacklisting instead of "
+        "falling back to a single NavigateToPose goal",
+        best.centroid_x, best.centroid_y);
+      blacklist_point(best.centroid_x, best.centroid_y);
+      return;
     }
+
+    auto waypoint_started = Clock::now();
+    auto waypoints = sample_waypoints(*gvd_path, 0.5);
+    record_timing("waypoint_sampling", waypoint_started);
+    if (waypoints.size() < 2U) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Sampled GVD-guided path collapsed below 2 waypoints for frontier (%.2f, %.2f); "
+        "blacklisting frontier",
+        best.centroid_x, best.centroid_y);
+      blacklist_point(best.centroid_x, best.centroid_y);
+      return;
+    }
+    const double gx = waypoints.back().first;
+    const double gy = waypoints.back().second;
+    RCLCPP_INFO(
+      get_logger(), "GVD-guided path found: %zu cells -> %zu waypoints",
+      gvd_path->size(), waypoints.size());
 
     const double dist_to_goal = std::hypot(gx - robot_xy->first, gy - robot_xy->second);
     if (dist_to_goal < 0.3) {
@@ -438,14 +496,10 @@ private:
 
     current_frontier_ = std::make_pair(best.centroid_x, best.centroid_y);
     auto send_started = Clock::now();
-    if (waypoints && waypoints->size() >= 2U) {
-      auto path_marker_started = Clock::now();
-      publish_path_markers(*waypoints);
-      record_timing("path_markers", path_marker_started);
-      navigate_through_poses(*waypoints);
-    } else {
-      navigate_to(gx, gy);
-    }
+    auto path_marker_started = Clock::now();
+    publish_path_markers(waypoints);
+    record_timing("path_markers", path_marker_started);
+    navigate_through_poses(waypoints);
     record_timing("send_goal", send_started);
     record_timing("plan_total", plan_started);
     ++timing_plan_counter_;
@@ -454,7 +508,7 @@ private:
 
   std::vector<Frontier> search_from(
     const std::pair<double, double> & robot_xy,
-    const std::vector<int> & dist_map)
+    const std::vector<double> & dist_map)
   {
     std::vector<Frontier> frontiers;
     if (width_ <= 0 || height_ <= 0 || map_array_.empty()) {
@@ -526,7 +580,7 @@ private:
   Frontier build_frontier(
     int sx, int sy, std::vector<uint8_t> & state,
     const std::pair<double, double> & robot_xy,
-    const std::vector<int> & dist_map)
+    const std::vector<double> & dist_map)
   {
     Frontier frontier;
     double sum_x = 0.0;
@@ -544,8 +598,7 @@ private:
       }
       state[current_idx] = 4;
 
-      const double wx = cx * resolution_ + origin_x_;
-      const double wy = cy * resolution_ + origin_y_;
+      const auto [wx, wy] = cell_center_world(cx, cy);
       sum_x += wx;
       sum_y += wy;
       frontier.size += 1;
@@ -618,7 +671,38 @@ private:
     return std::nullopt;
   }
 
-  const std::vector<int> & get_distance_transform()
+  bool is_obstacle_boundary_cell(int x, int y) const
+  {
+    const int idx0 = index(x, y);
+    if (!is_obstacle(idx0)) {
+      return false;
+    }
+    for (const auto & [dx, dy] : neighbors8_) {
+      const int nx = x + dx;
+      const int ny = y + dy;
+      if (!in_bounds(nx, ny)) {
+        return true;
+      }
+      if (!is_obstacle(index(nx, ny))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::pair<double, double> cell_center_world(int x, int y) const
+  {
+    return {
+      (static_cast<double>(x) + 0.5) * resolution_ + origin_x_,
+      (static_cast<double>(y) + 0.5) * resolution_ + origin_y_};
+  }
+
+  std::pair<double, double> gvd_world_point_for_cell(int x, int y) const
+  {
+    return cell_center_world(x, y);
+  }
+
+  const std::vector<double> & get_distance_transform()
   {
     if (!map_msg_) {
       return dist_map_;
@@ -637,77 +721,66 @@ private:
   void compute_distance_and_labels()
   {
     const int total = width_ * height_;
-    dist_map_.assign(static_cast<size_t>(total), -1);
-    label_map_.assign(static_cast<size_t>(total), -1);
-    std::vector<int> region_id(static_cast<size_t>(total), -1);
+    dist_map_.assign(static_cast<size_t>(total), std::numeric_limits<double>::infinity());
+    nearest_obstacle_.assign(static_cast<size_t>(total), -1);
 
-    int current_label = 0;
-    std::queue<int> queue;
+    // Brushfire: each obstacle cell is its own Voronoi site.
+    // We track which specific obstacle cell is nearest to every free cell.
+    std::priority_queue<SiteWavefront> open_set;
+    int counter = 0;
+    gvd_site_count_ = 0;
     for (int y = 0; y < height_; ++y) {
       for (int x = 0; x < width_; ++x) {
         const int idx = index(x, y);
-        if (!is_obstacle(idx) || region_id[idx] != -1) {
-          continue;
+        // Seed both obstacle (>50) and unknown (-1) cells as distance sources.
+        // Unknown cells act as boundaries so the GVD stops at unexplored edges
+        // but still produces skeleton lines in narrow passages near unknown areas.
+        const auto val = map_array_[idx];
+        if (val <= 0 && val != -1) {
+          continue;  // free cell (0), skip
         }
-        std::queue<int> cc_queue;
-        cc_queue.push(idx);
-        region_id[idx] = current_label;
-        while (!cc_queue.empty()) {
-          const int current = cc_queue.front();
-          cc_queue.pop();
-          const int cx = current % width_;
-          const int cy = current / width_;
-          for (const auto & [dx, dy] : neighbors8_) {
-            const int nx = cx + dx;
-            const int ny = cy + dy;
-            if (!in_bounds(nx, ny)) {
-              continue;
-            }
-            const int nidx = index(nx, ny);
-            if (is_obstacle(nidx) && region_id[nidx] == -1) {
-              region_id[nidx] = current_label;
-              cc_queue.push(nidx);
-            }
-          }
+        if (val == -1 || val > 50) {
+          dist_map_[idx] = 0.0;
+          nearest_obstacle_[idx] = idx;
+          open_set.push({0.0, counter++, idx, idx});
+          ++gvd_site_count_;
         }
-        ++current_label;
       }
     }
 
-    for (int idx = 0; idx < total; ++idx) {
-      if (!is_obstacle(idx)) {
+    while (!open_set.empty()) {
+      const auto current = open_set.top();
+      open_set.pop();
+      const int idx0 = current.index;
+      if (current.cost > dist_map_[idx0] + 1e-9) {
         continue;
       }
-      dist_map_[idx] = 0;
-      label_map_[idx] = region_id[idx];
-      queue.push(idx);
-    }
 
-    while (!queue.empty()) {
-      const int current = queue.front();
-      queue.pop();
-      const int cx = current % width_;
-      const int cy = current / width_;
-      const int nd = dist_map_[current] + 1;
-      const int lbl = label_map_[current];
-      for (const auto & [dx, dy] : neighbors4_) {
+      const int sx = current.seed_id % width_;
+      const int sy = current.seed_id / width_;
+      const int cx = idx0 % width_;
+      const int cy = idx0 / width_;
+      for (const auto & [dx, dy] : neighbors8_) {
         const int nx = cx + dx;
         const int ny = cy + dy;
         if (!in_bounds(nx, ny)) {
           continue;
         }
         const int nidx = index(nx, ny);
-        if (dist_map_[nidx] == -1) {
-          dist_map_[nidx] = nd;
-          label_map_[nidx] = lbl;
-          queue.push(nidx);
+        // Exact Euclidean distance from this neighbor to the seed obstacle cell
+        const double candidate = std::hypot(
+          static_cast<double>(nx - sx), static_cast<double>(ny - sy));
+        if (candidate + 1e-9 < dist_map_[nidx]) {
+          dist_map_[nidx] = candidate;
+          nearest_obstacle_[nidx] = current.seed_id;
+          open_set.push({candidate, counter++, nidx, current.seed_id});
         }
       }
     }
 
     for (auto & value : dist_map_) {
-      if (value < 0) {
-        value = 0;
+      if (!std::isfinite(value)) {
+        value = 0.0;
       }
     }
   }
@@ -716,31 +789,155 @@ private:
   {
     const int total = width_ * height_;
     gvd_mask_.assign(static_cast<size_t>(total), 0);
+    gvd_cell_count_ = 0;
+
+    // Medial-axis approach: the skeleton of the free space IS the GVD.
+    // Each skeleton point is equidistant to its 2 nearest obstacle cells.
+    // Step 1: mark all free cells with sufficient clearance as foreground.
+    // Step 2: Zhang-Suen thinning → 1-pixel wide connected skeleton.
+    const double min_c = static_cast<double>(gvd_min_clearance_);
     for (int y = 0; y < height_; ++y) {
       for (int x = 0; x < width_; ++x) {
-        const int idx0 = index(x, y);
-        if (map_array_[idx0] != 0 || dist_map_[idx0] < gvd_min_clearance_) {
-          continue;
-        }
-        bool different_neighbor = false;
-        for (const auto & [dx, dy] : neighbors4_) {
-          const int nx = x + dx;
-          const int ny = y + dy;
-          if (!in_bounds(nx, ny)) {
-            continue;
-          }
-          const int nidx = index(nx, ny);
-          if (label_map_[idx0] >= 0 && label_map_[nidx] >= 0 && label_map_[idx0] != label_map_[nidx]) {
-            different_neighbor = true;
-            break;
-          }
-        }
-        if (different_neighbor) {
-          gvd_mask_[idx0] = 1;
+        const int idx = index(x, y);
+        if (map_array_[idx] == 0 && dist_map_[idx] >= min_c) {
+          gvd_mask_[idx] = 1;
         }
       }
     }
-    (void) total;
+
+    int before_thin = 0;
+    for (int i = 0; i < total; ++i) {
+      if (gvd_mask_[i]) {
+        ++before_thin;
+      }
+    }
+
+    thin_gvd_zhang_suen();
+
+    gvd_cell_count_ = 0;
+    for (int i = 0; i < total; ++i) {
+      if (gvd_mask_[i]) {
+        ++gvd_cell_count_;
+      }
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "GVD medial axis: %d free cells → %d skeleton cells (thinned)",
+      before_thin, gvd_cell_count_);
+  }
+
+  /// Zhang-Suen morphological thinning — reduces gvd_mask_ to 1-pixel wide skeleton
+  void thin_gvd_zhang_suen()
+  {
+    // Neighbor layout (clockwise from top):
+    //   P9 P2 P3
+    //   P8 P1 P4
+    //   P7 P6 P5
+    const int total = width_ * height_;
+    std::vector<uint8_t> markers(static_cast<size_t>(total), 0);
+    bool changed = true;
+
+    while (changed) {
+      changed = false;
+
+      // --- Sub-iteration 1 ---
+      for (int y = 1; y < height_ - 1; ++y) {
+        for (int x = 1; x < width_ - 1; ++x) {
+          const int idx = index(x, y);
+          if (gvd_mask_[idx] == 0) {
+            continue;
+          }
+          const int P2 = gvd_mask_[index(x, y - 1)];
+          const int P3 = gvd_mask_[index(x + 1, y - 1)];
+          const int P4 = gvd_mask_[index(x + 1, y)];
+          const int P5 = gvd_mask_[index(x + 1, y + 1)];
+          const int P6 = gvd_mask_[index(x, y + 1)];
+          const int P7 = gvd_mask_[index(x - 1, y + 1)];
+          const int P8 = gvd_mask_[index(x - 1, y)];
+          const int P9 = gvd_mask_[index(x - 1, y - 1)];
+
+          const int B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9;
+          if (B < 2 || B > 6) {
+            continue;
+          }
+          int A = 0;
+          if (P2 == 0 && P3 == 1) { ++A; }
+          if (P3 == 0 && P4 == 1) { ++A; }
+          if (P4 == 0 && P5 == 1) { ++A; }
+          if (P5 == 0 && P6 == 1) { ++A; }
+          if (P6 == 0 && P7 == 1) { ++A; }
+          if (P7 == 0 && P8 == 1) { ++A; }
+          if (P8 == 0 && P9 == 1) { ++A; }
+          if (P9 == 0 && P2 == 1) { ++A; }
+          if (A != 1) {
+            continue;
+          }
+          if (P2 * P4 * P6 != 0) {
+            continue;
+          }
+          if (P4 * P6 * P8 != 0) {
+            continue;
+          }
+          markers[idx] = 1;
+        }
+      }
+      for (int i = 0; i < total; ++i) {
+        if (markers[i]) {
+          gvd_mask_[i] = 0;
+          markers[i] = 0;
+          changed = true;
+        }
+      }
+
+      // --- Sub-iteration 2 ---
+      for (int y = 1; y < height_ - 1; ++y) {
+        for (int x = 1; x < width_ - 1; ++x) {
+          const int idx = index(x, y);
+          if (gvd_mask_[idx] == 0) {
+            continue;
+          }
+          const int P2 = gvd_mask_[index(x, y - 1)];
+          const int P3 = gvd_mask_[index(x + 1, y - 1)];
+          const int P4 = gvd_mask_[index(x + 1, y)];
+          const int P5 = gvd_mask_[index(x + 1, y + 1)];
+          const int P6 = gvd_mask_[index(x, y + 1)];
+          const int P7 = gvd_mask_[index(x - 1, y + 1)];
+          const int P8 = gvd_mask_[index(x - 1, y)];
+          const int P9 = gvd_mask_[index(x - 1, y - 1)];
+
+          const int B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9;
+          if (B < 2 || B > 6) {
+            continue;
+          }
+          int A = 0;
+          if (P2 == 0 && P3 == 1) { ++A; }
+          if (P3 == 0 && P4 == 1) { ++A; }
+          if (P4 == 0 && P5 == 1) { ++A; }
+          if (P5 == 0 && P6 == 1) { ++A; }
+          if (P6 == 0 && P7 == 1) { ++A; }
+          if (P7 == 0 && P8 == 1) { ++A; }
+          if (P8 == 0 && P9 == 1) { ++A; }
+          if (P9 == 0 && P2 == 1) { ++A; }
+          if (A != 1) {
+            continue;
+          }
+          if (P2 * P4 * P8 != 0) {
+            continue;
+          }
+          if (P2 * P6 * P8 != 0) {
+            continue;
+          }
+          markers[idx] = 1;
+        }
+      }
+      for (int i = 0; i < total; ++i) {
+        if (markers[i]) {
+          gvd_mask_[i] = 0;
+          markers[i] = 0;
+          changed = true;
+        }
+      }
+    }
   }
 
   std::pair<double, double> snap_to_gvd(
@@ -757,7 +954,7 @@ private:
     px = std::clamp(px, 0, width_ - 1);
     py = std::clamp(py, 0, height_ - 1);
     if (gvd_mask_[index(px, py)]) {
-      return point;
+      return gvd_world_point_for_cell(px, py);
     }
 
     const double robot_to_frontier = std::hypot(point.first - robot_xy.first, point.second - robot_xy.second);
@@ -770,8 +967,7 @@ private:
         if (!gvd_mask_[index(x, y)]) {
           continue;
         }
-        const double wx = x * resolution_ + origin_x_;
-        const double wy = y * resolution_ + origin_y_;
+        const auto [wx, wy] = gvd_world_point_for_cell(x, y);
         const double cand_to_robot = std::hypot(wx - robot_xy.first, wy - robot_xy.second);
         if (cand_to_robot >= robot_to_frontier) {
           continue;
@@ -814,7 +1010,9 @@ private:
         if (!gvd_mask_[index(x, y)]) {
           continue;
         }
-        const int d2 = (x - px) * (x - px) + (y - py) * (y - py);
+        const auto [gx, gy] = gvd_world_point_for_cell(x, y);
+        const int d2 = static_cast<int>(std::llround(
+          1000.0 * ((gx - wx) * (gx - wx) + (gy - wy) * (gy - wy))));
         if (d2 < best_d2) {
           best_d2 = d2;
           best_x = x;
@@ -829,19 +1027,37 @@ private:
     return std::make_pair(best_x, best_y);
   }
 
+  std::optional<std::pair<int, int>> nearest_free_cell_from_world(
+    double wx, double wy, double max_radius_m = 2.0) const
+  {
+    if (width_ <= 0 || height_ <= 0 || resolution_ <= 0.0) {
+      return std::nullopt;
+    }
+
+    const int px = std::clamp(static_cast<int>((wx - origin_x_) / resolution_), 0, width_ - 1);
+    const int py = std::clamp(static_cast<int>((wy - origin_y_) / resolution_), 0, height_ - 1);
+    if (map_value(px, py) == 0) {
+      return std::make_pair(px, py);
+    }
+
+    const int max_cells = std::max(1, static_cast<int>(std::ceil(max_radius_m / resolution_)));
+    return nearest_free_cell(px, py, max_cells + 1);
+  }
+
   std::optional<std::vector<std::pair<double, double>>> find_gvd_path(
     const std::pair<double, double> & robot_xy,
     const std::pair<double, double> & goal_xy)
   {
     get_distance_transform();
-    if (gvd_mask_.empty()) {
+    if (gvd_mask_.empty() || width_ <= 0 || height_ <= 0 || map_array_.empty()) {
       return std::nullopt;
     }
-    const auto start = nearest_gvd_cell(robot_xy.first, robot_xy.second);
-    const auto end = nearest_gvd_cell(goal_xy.first, goal_xy.second);
+    const auto start = nearest_free_cell_from_world(robot_xy.first, robot_xy.second, 1.5);
+    const auto end = nearest_free_cell_from_world(
+      goal_xy.first, goal_xy.second, std::max(gvd_snap_radius_, 1.5));
     if (!start || !end) {
       RCLCPP_INFO(
-        get_logger(), "GVD path: no GVD cell near %s",
+        get_logger(), "GVD-guided path: no free cell near %s",
         !start ? "robot" : "goal");
       return std::nullopt;
     }
@@ -852,6 +1068,7 @@ private:
     const int total = width_ * height_;
     std::vector<double> g_score(static_cast<size_t>(total), std::numeric_limits<double>::infinity());
     std::vector<int> came_from(static_cast<size_t>(total), -1);
+    std::vector<uint8_t> closed(static_cast<size_t>(total), 0);
     std::priority_queue<IndexedCost> open_set;
 
     const int start_idx = index(start->first, start->second);
@@ -864,6 +1081,10 @@ private:
       const auto current = open_set.top();
       open_set.pop();
       const int idx0 = current.index;
+      if (closed[idx0]) {
+        continue;
+      }
+      closed[idx0] = 1;
       if (idx0 == end_idx) {
         std::vector<int> path_cells;
         for (int node = end_idx; node != -1; node = came_from[node]) {
@@ -875,12 +1096,21 @@ private:
         std::reverse(path_cells.begin(), path_cells.end());
         std::vector<std::pair<double, double>> path;
         path.reserve(path_cells.size());
+        int gvd_cells = 0;
         for (int cell : path_cells) {
           const int x = cell % width_;
           const int y = cell / width_;
-          path.emplace_back(x * resolution_ + origin_x_, y * resolution_ + origin_y_);
+          if (gvd_mask_[cell]) {
+            ++gvd_cells;
+          }
+          path.push_back(gvd_world_point_for_cell(x, y));
         }
-        RCLCPP_INFO(get_logger(), "GVD path: %zu cells on skeleton", path.size());
+        const double frontier_offset = std::hypot(
+          path.back().first - goal_xy.first, path.back().second - goal_xy.second);
+        RCLCPP_INFO(
+          get_logger(),
+          "GVD-guided path: %zu cells, %d on GVD, end offset %.2fm",
+          path.size(), gvd_cells, frontier_offset);
         return path;
       }
 
@@ -893,11 +1123,11 @@ private:
           continue;
         }
         const int nidx = index(nx, ny);
-        if (!gvd_mask_[nidx]) {
+        if (map_value(nx, ny) != 0 && nidx != end_idx) {
           continue;
         }
         const double step_cost = (dx != 0 && dy != 0) ? std::sqrt(2.0) : 1.0;
-        const double tentative_g = g_score[idx0] + step_cost;
+        const double tentative_g = g_score[idx0] + step_cost * (gvd_mask_[nidx] ? 1.0 : kOffGvdPenalty);
         if (tentative_g < g_score[nidx]) {
           came_from[nidx] = idx0;
           g_score[nidx] = tentative_g;
@@ -909,7 +1139,7 @@ private:
       }
     }
 
-    RCLCPP_INFO(get_logger(), "GVD path: A* failed");
+    RCLCPP_INFO(get_logger(), "GVD-guided path: A* failed");
     return std::nullopt;
   }
 
@@ -1294,8 +1524,10 @@ private:
           if ((edge_counter++ % gvd_marker_stride_) != 0) {
             continue;
           }
-          line.points.push_back(make_point(x * resolution_ + origin_x_, y * resolution_ + origin_y_, 0.05));
-          line.points.push_back(make_point(nx * resolution_ + origin_x_, ny * resolution_ + origin_y_, 0.05));
+          const auto [wx0, wy0] = gvd_world_point_for_cell(x, y);
+          const auto [wx1, wy1] = gvd_world_point_for_cell(nx, ny);
+          line.points.push_back(make_point(wx0, wy0, 0.05));
+          line.points.push_back(make_point(wx1, wy1, 0.05));
         }
       }
     }
@@ -1359,7 +1591,7 @@ private:
   void clear_map_caches()
   {
     dist_map_.clear();
-    label_map_.clear();
+    nearest_obstacle_.clear();
     gvd_mask_.clear();
     cached_gvd_marker_valid_ = false;
   }
@@ -1382,9 +1614,10 @@ private:
       map_to_odom_xy_->first + cos_y * odom_pose_->first - sin_y * odom_pose_->second,
       map_to_odom_xy_->second + sin_y * odom_pose_->first + cos_y * odom_pose_->second);
     robot_pose_stamp_ = odom_stamp_;
-    if (tf_sub_) {
+    if (tf_sub_ || tf_static_sub_) {
       RCLCPP_INFO(get_logger(), "Initial map pose cached; switching to odom-delta tracking");
       tf_sub_.reset();
+      tf_static_sub_.reset();
     }
   }
 
@@ -1524,6 +1757,8 @@ private:
   std::string odom_frame_;
   std::string odom_topic_;
   std::string global_frame_;
+  std::string map_topic_;
+  std::string live_map_ready_topic_;
   double tf_tolerance_{2.0};
   double blacklist_radius_{0.5};
   double blacklist_timeout_{60.0};
@@ -1540,10 +1775,13 @@ private:
   double profile_log_interval_{15.0};
   bool profile_callbacks_{false};
   double profile_callback_log_interval_{10.0};
+  bool require_live_map_{false};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr live_map_ready_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_sub_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resume_sub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gvd_marker_pub_;
@@ -1561,6 +1799,7 @@ private:
   double origin_y_{0.0};
 
   bool exploring_{true};
+  bool live_map_ready_{false};
   bool navigating_{false};
   int goal_seq_{0};
   std::optional<std::pair<double, double>> current_goal_;
@@ -1574,9 +1813,11 @@ private:
   GoalHandleNavTo::SharedPtr nav_to_goal_handle_;
   GoalHandleNavThrough::SharedPtr nav_through_goal_handle_;
 
-  std::vector<int> dist_map_;
-  std::vector<int> label_map_;
+  std::vector<double> dist_map_;
+  std::vector<int> nearest_obstacle_;
   std::vector<uint8_t> gvd_mask_;
+  int gvd_site_count_{0};
+  int gvd_cell_count_{0};
   builtin_interfaces::msg::Time cached_map_stamp_;
 
   visualization_msgs::msg::MarkerArray cached_gvd_marker_array_;

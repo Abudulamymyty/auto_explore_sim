@@ -22,6 +22,9 @@ frontier_explorer:
     odom_frame: odom
     odom_topic: /odom
     global_frame: map
+    map_topic: /map
+    live_map_ready_topic: /map_live_ready
+    require_live_map: false
 
     # TF lookup tolerance (seconds)
     transform_tolerance: 2.0
