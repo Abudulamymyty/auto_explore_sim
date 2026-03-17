@@ -61,14 +61,14 @@ struct IndexedCost
   }
 };
 
-struct SiteWavefront
+struct WavefrontEntry
 {
   double cost;
   int counter;
   int index;
-  int seed_id;
+  int site_id;
 
-  bool operator<(const SiteWavefront & other) const
+  bool operator<(const WavefrontEntry & other) const
   {
     if (cost != other.cost) {
       return cost > other.cost;
@@ -76,6 +76,11 @@ struct SiteWavefront
     return counter > other.counter;
   }
 };
+
+constexpr double kVoronoiDistanceToleranceCells = 0.75;
+constexpr double kVoronoiMaxDotProduct = 0.5;
+constexpr double kOffSkeletonStepPenalty = 3.0;
+constexpr double kLowClearancePenaltyScale = 0.5;
 
 inline bool same_stamp(
   const builtin_interfaces::msg::Time & a,
@@ -92,8 +97,6 @@ inline geometry_msgs::msg::Point make_point(double x, double y, double z)
   point.z = z;
   return point;
 }
-
-constexpr double kOffGvdPenalty = 4.0;
 }  // namespace
 
 class FrontierExplorerNode : public rclcpp::Node
@@ -109,13 +112,13 @@ public:
   {
     declare_parameter("planner_frequency", 0.5);
     declare_parameter("min_frontier_size", 5);
-    declare_parameter("robot_base_frame", "base_link");
+    declare_parameter("robot_base_frame", "base");
     declare_parameter("odom_frame", "odom");
-    declare_parameter("odom_topic", "/odom");
+    declare_parameter("odom_topic", "/lightning/odometry");
     declare_parameter("global_frame", "map");
     declare_parameter("map_topic", "/map");
     declare_parameter("live_map_ready_topic", "/map_live_ready");
-    declare_parameter("require_live_map", false);
+    declare_parameter("require_live_map", true);
     declare_parameter("transform_tolerance", 2.0);
     declare_parameter("blacklist_radius", 0.5);
     declare_parameter("blacklist_timeout", 60.0);
@@ -448,33 +451,28 @@ private:
     auto gvd_started = Clock::now();
     auto gvd_path = find_gvd_path(*robot_xy, {best.centroid_x, best.centroid_y});
     record_timing("gvd_path_search", gvd_started);
-    if (!gvd_path || gvd_path->size() < 2U) {
-      RCLCPP_WARN(
-        get_logger(),
-        "No GVD-guided waypoint path to frontier (%.2f, %.2f); blacklisting instead of "
-        "falling back to a single NavigateToPose goal",
-        best.centroid_x, best.centroid_y);
-      blacklist_point(best.centroid_x, best.centroid_y);
-      return;
-    }
 
-    auto waypoint_started = Clock::now();
-    auto waypoints = sample_waypoints(*gvd_path, 0.5);
-    record_timing("waypoint_sampling", waypoint_started);
-    if (waypoints.size() < 2U) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Sampled GVD-guided path collapsed below 2 waypoints for frontier (%.2f, %.2f); "
-        "blacklisting frontier",
-        best.centroid_x, best.centroid_y);
-      blacklist_point(best.centroid_x, best.centroid_y);
-      return;
+    std::optional<std::vector<std::pair<double, double>>> waypoints;
+    double gx = best.centroid_x;
+    double gy = best.centroid_y;
+    if (gvd_path && gvd_path->size() >= 2U) {
+      auto waypoint_started = Clock::now();
+      waypoints = sample_waypoints(*gvd_path, 0.5);
+      record_timing("waypoint_sampling", waypoint_started);
+      gx = waypoints->back().first;
+      gy = waypoints->back().second;
+      RCLCPP_INFO(
+        get_logger(), "GVD path found: %zu cells -> %zu waypoints",
+        gvd_path->size(), waypoints->size());
+    } else {
+      auto snap_started = Clock::now();
+      const auto snapped = snap_to_gvd(
+        {best.centroid_x, best.centroid_y}, *robot_xy);
+      record_timing("gvd_snap_fallback", snap_started);
+      gx = snapped.first;
+      gy = snapped.second;
+      RCLCPP_INFO(get_logger(), "No GVD path - using single goal fallback");
     }
-    const double gx = waypoints.back().first;
-    const double gy = waypoints.back().second;
-    RCLCPP_INFO(
-      get_logger(), "GVD-guided path found: %zu cells -> %zu waypoints",
-      gvd_path->size(), waypoints.size());
 
     const double dist_to_goal = std::hypot(gx - robot_xy->first, gy - robot_xy->second);
     if (dist_to_goal < 0.3) {
@@ -496,10 +494,14 @@ private:
 
     current_frontier_ = std::make_pair(best.centroid_x, best.centroid_y);
     auto send_started = Clock::now();
-    auto path_marker_started = Clock::now();
-    publish_path_markers(waypoints);
-    record_timing("path_markers", path_marker_started);
-    navigate_through_poses(waypoints);
+    if (waypoints && waypoints->size() >= 2U) {
+      auto path_marker_started = Clock::now();
+      publish_path_markers(*waypoints);
+      record_timing("path_markers", path_marker_started);
+      navigate_through_poses(*waypoints);
+    } else {
+      navigate_to(gx, gy);
+    }
     record_timing("send_goal", send_started);
     record_timing("plan_total", plan_started);
     ++timing_plan_counter_;
@@ -598,7 +600,8 @@ private:
       }
       state[current_idx] = 4;
 
-      const auto [wx, wy] = cell_center_world(cx, cy);
+      const double wx = cx * resolution_ + origin_x_;
+      const double wy = cy * resolution_ + origin_y_;
       sum_x += wx;
       sum_y += wy;
       frontier.size += 1;
@@ -697,8 +700,52 @@ private:
       (static_cast<double>(y) + 0.5) * resolution_ + origin_y_};
   }
 
+  double distance_to_site_cells(int x, int y, int site_id) const
+  {
+    if (site_id < 0 || static_cast<size_t>(site_id) >= site_xs_.size()) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return std::hypot(
+      static_cast<double>(x - site_xs_[static_cast<size_t>(site_id)]),
+      static_cast<double>(y - site_ys_[static_cast<size_t>(site_id)]));
+  }
+
+  std::pair<double, double> project_to_voronoi_bisector(int x, int y, int site_a, int site_b) const
+  {
+    const auto point = cell_center_world(x, y);
+    if (site_a < 0 || site_b < 0 || static_cast<size_t>(site_a) >= site_xs_.size() ||
+      static_cast<size_t>(site_b) >= site_xs_.size() || site_a == site_b)
+    {
+      return point;
+    }
+
+    const auto site_a_world =
+      cell_center_world(site_xs_[static_cast<size_t>(site_a)], site_ys_[static_cast<size_t>(site_a)]);
+    const auto site_b_world =
+      cell_center_world(site_xs_[static_cast<size_t>(site_b)], site_ys_[static_cast<size_t>(site_b)]);
+    const double dx = site_b_world.first - site_a_world.first;
+    const double dy = site_b_world.second - site_a_world.second;
+    const double length = std::hypot(dx, dy);
+    if (length <= 1e-9) {
+      return point;
+    }
+
+    const double nx = dx / length;
+    const double ny = dy / length;
+    const double mid_x = 0.5 * (site_a_world.first + site_b_world.first);
+    const double mid_y = 0.5 * (site_a_world.second + site_b_world.second);
+    const double shift = (mid_x - point.first) * nx + (mid_y - point.second) * ny;
+    return {point.first + shift * nx, point.second + shift * ny};
+  }
+
   std::pair<double, double> gvd_world_point_for_cell(int x, int y) const
   {
+    const int idx0 = index(x, y);
+    if (idx0 >= 0 && static_cast<size_t>(idx0) < gvd_world_x_.size()) {
+      return {
+        gvd_world_x_[static_cast<size_t>(idx0)],
+        gvd_world_y_[static_cast<size_t>(idx0)]};
+    }
     return cell_center_world(x, y);
   }
 
@@ -722,29 +769,24 @@ private:
   {
     const int total = width_ * height_;
     dist_map_.assign(static_cast<size_t>(total), std::numeric_limits<double>::infinity());
-    nearest_obstacle_.assign(static_cast<size_t>(total), -1);
+    label_map_.assign(static_cast<size_t>(total), -1);
+    site_xs_.clear();
+    site_ys_.clear();
 
-    // Brushfire: each obstacle cell is its own Voronoi site.
-    // We track which specific obstacle cell is nearest to every free cell.
-    std::priority_queue<SiteWavefront> open_set;
+    std::priority_queue<WavefrontEntry> open_set;
     int counter = 0;
-    gvd_site_count_ = 0;
     for (int y = 0; y < height_; ++y) {
       for (int x = 0; x < width_; ++x) {
         const int idx = index(x, y);
-        // Seed both obstacle (>50) and unknown (-1) cells as distance sources.
-        // Unknown cells act as boundaries so the GVD stops at unexplored edges
-        // but still produces skeleton lines in narrow passages near unknown areas.
-        const auto val = map_array_[idx];
-        if (val <= 0 && val != -1) {
-          continue;  // free cell (0), skip
+        if (!is_obstacle(idx) || !is_obstacle_boundary_cell(x, y)) {
+          continue;
         }
-        if (val == -1 || val > 50) {
-          dist_map_[idx] = 0.0;
-          nearest_obstacle_[idx] = idx;
-          open_set.push({0.0, counter++, idx, idx});
-          ++gvd_site_count_;
-        }
+        const int site_id = static_cast<int>(site_xs_.size());
+        site_xs_.push_back(x);
+        site_ys_.push_back(y);
+        dist_map_[static_cast<size_t>(idx)] = 0.0;
+        label_map_[static_cast<size_t>(idx)] = site_id;
+        open_set.push({0.0, counter++, idx, site_id});
       }
     }
 
@@ -752,12 +794,12 @@ private:
       const auto current = open_set.top();
       open_set.pop();
       const int idx0 = current.index;
-      if (current.cost > dist_map_[idx0] + 1e-9) {
+      if (current.cost > dist_map_[static_cast<size_t>(idx0)] + 1e-9 ||
+        label_map_[static_cast<size_t>(idx0)] != current.site_id)
+      {
         continue;
       }
 
-      const int sx = current.seed_id % width_;
-      const int sy = current.seed_id / width_;
       const int cx = idx0 % width_;
       const int cy = idx0 / width_;
       for (const auto & [dx, dy] : neighbors8_) {
@@ -767,13 +809,20 @@ private:
           continue;
         }
         const int nidx = index(nx, ny);
-        // Exact Euclidean distance from this neighbor to the seed obstacle cell
-        const double candidate = std::hypot(
-          static_cast<double>(nx - sx), static_cast<double>(ny - sy));
-        if (candidate + 1e-9 < dist_map_[nidx]) {
-          dist_map_[nidx] = candidate;
-          nearest_obstacle_[nidx] = current.seed_id;
-          open_set.push({candidate, counter++, nidx, current.seed_id});
+        if (is_obstacle(nidx)) {
+          continue;
+        }
+
+        const double candidate = distance_to_site_cells(nx, ny, current.site_id);
+        double & current_dist = dist_map_[static_cast<size_t>(nidx)];
+        int & current_label = label_map_[static_cast<size_t>(nidx)];
+        if (candidate + 1e-9 < current_dist ||
+          (std::abs(candidate - current_dist) <= 1e-9 &&
+          (current_label < 0 || current.site_id < current_label)))
+        {
+          current_dist = candidate;
+          current_label = current.site_id;
+          open_set.push({candidate, counter++, nidx, current.site_id});
         }
       }
     }
@@ -789,155 +838,101 @@ private:
   {
     const int total = width_ * height_;
     gvd_mask_.assign(static_cast<size_t>(total), 0);
-    gvd_cell_count_ = 0;
-
-    // Medial-axis approach: the skeleton of the free space IS the GVD.
-    // Each skeleton point is equidistant to its 2 nearest obstacle cells.
-    // Step 1: mark all free cells with sufficient clearance as foreground.
-    // Step 2: Zhang-Suen thinning → 1-pixel wide connected skeleton.
-    const double min_c = static_cast<double>(gvd_min_clearance_);
+    gvd_world_x_.assign(static_cast<size_t>(total), 0.0);
+    gvd_world_y_.assign(static_cast<size_t>(total), 0.0);
+    int gvd_count = 0;
     for (int y = 0; y < height_; ++y) {
       for (int x = 0; x < width_; ++x) {
-        const int idx = index(x, y);
-        if (map_array_[idx] == 0 && dist_map_[idx] >= min_c) {
-          gvd_mask_[idx] = 1;
+        const int idx0 = index(x, y);
+        const auto center = cell_center_world(x, y);
+        gvd_world_x_[static_cast<size_t>(idx0)] = center.first;
+        gvd_world_y_[static_cast<size_t>(idx0)] = center.second;
+
+        if (map_array_[idx0] != 0 ||
+          dist_map_[static_cast<size_t>(idx0)] < static_cast<double>(gvd_min_clearance_))
+        {
+          continue;
         }
-      }
-    }
 
-    int before_thin = 0;
-    for (int i = 0; i < total; ++i) {
-      if (gvd_mask_[i]) {
-        ++before_thin;
-      }
-    }
+        std::array<int, 9> candidate_sites{};
+        int candidate_count = 0;
+        auto add_candidate = [&](int site_id) {
+            if (site_id < 0) {
+              return;
+            }
+            for (int i = 0; i < candidate_count; ++i) {
+              if (candidate_sites[static_cast<size_t>(i)] == site_id) {
+                return;
+              }
+            }
+            if (candidate_count < static_cast<int>(candidate_sites.size())) {
+              candidate_sites[static_cast<size_t>(candidate_count++)] = site_id;
+            }
+          };
 
-    thin_gvd_zhang_suen();
+        add_candidate(label_map_[static_cast<size_t>(idx0)]);
+        for (const auto & [dx, dy] : neighbors8_) {
+          const int nx = x + dx;
+          const int ny = y + dy;
+          if (!in_bounds(nx, ny)) {
+            continue;
+          }
+          add_candidate(label_map_[static_cast<size_t>(index(nx, ny))]);
+        }
 
-    gvd_cell_count_ = 0;
-    for (int i = 0; i < total; ++i) {
-      if (gvd_mask_[i]) {
-        ++gvd_cell_count_;
+        if (candidate_count < 2) {
+          continue;
+        }
+
+        double best_pair_diff = std::numeric_limits<double>::infinity();
+        int best_site = -1;
+        int second_site = -1;
+        for (int i = 0; i < candidate_count; ++i) {
+          const int site_a = candidate_sites[static_cast<size_t>(i)];
+          const double dist_a = distance_to_site_cells(x, y, site_a);
+          for (int j = i + 1; j < candidate_count; ++j) {
+            const int site_b = candidate_sites[static_cast<size_t>(j)];
+            const double dist_b = distance_to_site_cells(x, y, site_b);
+            const double diff = std::abs(dist_a - dist_b);
+            if (diff > kVoronoiDistanceToleranceCells || diff >= best_pair_diff) {
+              continue;
+            }
+
+            const double ax = static_cast<double>(site_xs_[static_cast<size_t>(site_a)] - x);
+            const double ay = static_cast<double>(site_ys_[static_cast<size_t>(site_a)] - y);
+            const double bx = static_cast<double>(site_xs_[static_cast<size_t>(site_b)] - x);
+            const double by = static_cast<double>(site_ys_[static_cast<size_t>(site_b)] - y);
+            const double a_norm = std::hypot(ax, ay);
+            const double b_norm = std::hypot(bx, by);
+            if (a_norm <= 1e-9 || b_norm <= 1e-9) {
+              continue;
+            }
+            const double dot = (ax * bx + ay * by) / (a_norm * b_norm);
+            if (dot > kVoronoiMaxDotProduct) {
+              continue;
+            }
+
+            best_pair_diff = diff;
+            best_site = site_a;
+            second_site = site_b;
+          }
+        }
+
+        if (best_site < 0 || second_site < 0) {
+          continue;
+        }
+
+        gvd_mask_[static_cast<size_t>(idx0)] = 1;
+        const auto projected = project_to_voronoi_bisector(x, y, best_site, second_site);
+        gvd_world_x_[static_cast<size_t>(idx0)] = projected.first;
+        gvd_world_y_[static_cast<size_t>(idx0)] = projected.second;
+        ++gvd_count;
       }
     }
 
     RCLCPP_INFO(
-      get_logger(), "GVD medial axis: %d free cells → %d skeleton cells (thinned)",
-      before_thin, gvd_cell_count_);
-  }
-
-  /// Zhang-Suen morphological thinning — reduces gvd_mask_ to 1-pixel wide skeleton
-  void thin_gvd_zhang_suen()
-  {
-    // Neighbor layout (clockwise from top):
-    //   P9 P2 P3
-    //   P8 P1 P4
-    //   P7 P6 P5
-    const int total = width_ * height_;
-    std::vector<uint8_t> markers(static_cast<size_t>(total), 0);
-    bool changed = true;
-
-    while (changed) {
-      changed = false;
-
-      // --- Sub-iteration 1 ---
-      for (int y = 1; y < height_ - 1; ++y) {
-        for (int x = 1; x < width_ - 1; ++x) {
-          const int idx = index(x, y);
-          if (gvd_mask_[idx] == 0) {
-            continue;
-          }
-          const int P2 = gvd_mask_[index(x, y - 1)];
-          const int P3 = gvd_mask_[index(x + 1, y - 1)];
-          const int P4 = gvd_mask_[index(x + 1, y)];
-          const int P5 = gvd_mask_[index(x + 1, y + 1)];
-          const int P6 = gvd_mask_[index(x, y + 1)];
-          const int P7 = gvd_mask_[index(x - 1, y + 1)];
-          const int P8 = gvd_mask_[index(x - 1, y)];
-          const int P9 = gvd_mask_[index(x - 1, y - 1)];
-
-          const int B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9;
-          if (B < 2 || B > 6) {
-            continue;
-          }
-          int A = 0;
-          if (P2 == 0 && P3 == 1) { ++A; }
-          if (P3 == 0 && P4 == 1) { ++A; }
-          if (P4 == 0 && P5 == 1) { ++A; }
-          if (P5 == 0 && P6 == 1) { ++A; }
-          if (P6 == 0 && P7 == 1) { ++A; }
-          if (P7 == 0 && P8 == 1) { ++A; }
-          if (P8 == 0 && P9 == 1) { ++A; }
-          if (P9 == 0 && P2 == 1) { ++A; }
-          if (A != 1) {
-            continue;
-          }
-          if (P2 * P4 * P6 != 0) {
-            continue;
-          }
-          if (P4 * P6 * P8 != 0) {
-            continue;
-          }
-          markers[idx] = 1;
-        }
-      }
-      for (int i = 0; i < total; ++i) {
-        if (markers[i]) {
-          gvd_mask_[i] = 0;
-          markers[i] = 0;
-          changed = true;
-        }
-      }
-
-      // --- Sub-iteration 2 ---
-      for (int y = 1; y < height_ - 1; ++y) {
-        for (int x = 1; x < width_ - 1; ++x) {
-          const int idx = index(x, y);
-          if (gvd_mask_[idx] == 0) {
-            continue;
-          }
-          const int P2 = gvd_mask_[index(x, y - 1)];
-          const int P3 = gvd_mask_[index(x + 1, y - 1)];
-          const int P4 = gvd_mask_[index(x + 1, y)];
-          const int P5 = gvd_mask_[index(x + 1, y + 1)];
-          const int P6 = gvd_mask_[index(x, y + 1)];
-          const int P7 = gvd_mask_[index(x - 1, y + 1)];
-          const int P8 = gvd_mask_[index(x - 1, y)];
-          const int P9 = gvd_mask_[index(x - 1, y - 1)];
-
-          const int B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9;
-          if (B < 2 || B > 6) {
-            continue;
-          }
-          int A = 0;
-          if (P2 == 0 && P3 == 1) { ++A; }
-          if (P3 == 0 && P4 == 1) { ++A; }
-          if (P4 == 0 && P5 == 1) { ++A; }
-          if (P5 == 0 && P6 == 1) { ++A; }
-          if (P6 == 0 && P7 == 1) { ++A; }
-          if (P7 == 0 && P8 == 1) { ++A; }
-          if (P8 == 0 && P9 == 1) { ++A; }
-          if (P9 == 0 && P2 == 1) { ++A; }
-          if (A != 1) {
-            continue;
-          }
-          if (P2 * P4 * P8 != 0) {
-            continue;
-          }
-          if (P2 * P6 * P8 != 0) {
-            continue;
-          }
-          markers[idx] = 1;
-        }
-      }
-      for (int i = 0; i < total; ++i) {
-        if (markers[i]) {
-          gvd_mask_[i] = 0;
-          markers[i] = 0;
-          changed = true;
-        }
-      }
-    }
+      get_logger(), "GVD rebuilt: %zu boundary sites, %d Voronoi cells",
+      site_xs_.size(), gvd_count);
   }
 
   std::pair<double, double> snap_to_gvd(
@@ -1010,9 +1005,7 @@ private:
         if (!gvd_mask_[index(x, y)]) {
           continue;
         }
-        const auto [gx, gy] = gvd_world_point_for_cell(x, y);
-        const int d2 = static_cast<int>(std::llround(
-          1000.0 * ((gx - wx) * (gx - wx) + (gy - wy) * (gy - wy))));
+        const int d2 = (x - px) * (x - px) + (y - py) * (y - py);
         if (d2 < best_d2) {
           best_d2 = d2;
           best_x = x;
@@ -1027,91 +1020,36 @@ private:
     return std::make_pair(best_x, best_y);
   }
 
-  std::optional<std::pair<int, int>> nearest_free_cell_from_world(
-    double wx, double wy, double max_radius_m = 2.0) const
+  std::optional<std::vector<int>> find_cell_path(
+    int start_idx, int end_idx, bool skeleton_only, int & explored_cells) const
   {
-    if (width_ <= 0 || height_ <= 0 || resolution_ <= 0.0) {
-      return std::nullopt;
-    }
-
-    const int px = std::clamp(static_cast<int>((wx - origin_x_) / resolution_), 0, width_ - 1);
-    const int py = std::clamp(static_cast<int>((wy - origin_y_) / resolution_), 0, height_ - 1);
-    if (map_value(px, py) == 0) {
-      return std::make_pair(px, py);
-    }
-
-    const int max_cells = std::max(1, static_cast<int>(std::ceil(max_radius_m / resolution_)));
-    return nearest_free_cell(px, py, max_cells + 1);
-  }
-
-  std::optional<std::vector<std::pair<double, double>>> find_gvd_path(
-    const std::pair<double, double> & robot_xy,
-    const std::pair<double, double> & goal_xy)
-  {
-    get_distance_transform();
-    if (gvd_mask_.empty() || width_ <= 0 || height_ <= 0 || map_array_.empty()) {
-      return std::nullopt;
-    }
-    const auto start = nearest_free_cell_from_world(robot_xy.first, robot_xy.second, 1.5);
-    const auto end = nearest_free_cell_from_world(
-      goal_xy.first, goal_xy.second, std::max(gvd_snap_radius_, 1.5));
-    if (!start || !end) {
-      RCLCPP_INFO(
-        get_logger(), "GVD-guided path: no free cell near %s",
-        !start ? "robot" : "goal");
-      return std::nullopt;
-    }
-    if (*start == *end) {
-      return std::nullopt;
-    }
-
     const int total = width_ * height_;
     std::vector<double> g_score(static_cast<size_t>(total), std::numeric_limits<double>::infinity());
     std::vector<int> came_from(static_cast<size_t>(total), -1);
-    std::vector<uint8_t> closed(static_cast<size_t>(total), 0);
     std::priority_queue<IndexedCost> open_set;
 
-    const int start_idx = index(start->first, start->second);
-    const int end_idx = index(end->first, end->second);
-    g_score[start_idx] = 0.0;
+    g_score[static_cast<size_t>(start_idx)] = 0.0;
     int counter = 0;
     open_set.push({0.0, counter, start_idx});
+
+    const int ex = end_idx % width_;
+    const int ey = end_idx / width_;
 
     while (!open_set.empty()) {
       const auto current = open_set.top();
       open_set.pop();
       const int idx0 = current.index;
-      if (closed[idx0]) {
-        continue;
-      }
-      closed[idx0] = 1;
+      ++explored_cells;
       if (idx0 == end_idx) {
         std::vector<int> path_cells;
-        for (int node = end_idx; node != -1; node = came_from[node]) {
+        for (int node = end_idx; node != -1; node = came_from[static_cast<size_t>(node)]) {
           path_cells.push_back(node);
           if (node == start_idx) {
             break;
           }
         }
         std::reverse(path_cells.begin(), path_cells.end());
-        std::vector<std::pair<double, double>> path;
-        path.reserve(path_cells.size());
-        int gvd_cells = 0;
-        for (int cell : path_cells) {
-          const int x = cell % width_;
-          const int y = cell / width_;
-          if (gvd_mask_[cell]) {
-            ++gvd_cells;
-          }
-          path.push_back(gvd_world_point_for_cell(x, y));
-        }
-        const double frontier_offset = std::hypot(
-          path.back().first - goal_xy.first, path.back().second - goal_xy.second);
-        RCLCPP_INFO(
-          get_logger(),
-          "GVD-guided path: %zu cells, %d on GVD, end offset %.2fm",
-          path.size(), gvd_cells, frontier_offset);
-        return path;
+        return path_cells;
       }
 
       const int cx = idx0 % width_;
@@ -1122,25 +1060,91 @@ private:
         if (!in_bounds(nx, ny)) {
           continue;
         }
+
         const int nidx = index(nx, ny);
-        if (map_value(nx, ny) != 0 && nidx != end_idx) {
+        if (map_array_[static_cast<size_t>(nidx)] != 0) {
           continue;
         }
-        const double step_cost = (dx != 0 && dy != 0) ? std::sqrt(2.0) : 1.0;
-        const double tentative_g = g_score[idx0] + step_cost * (gvd_mask_[nidx] ? 1.0 : kOffGvdPenalty);
-        if (tentative_g < g_score[nidx]) {
-          came_from[nidx] = idx0;
-          g_score[nidx] = tentative_g;
-          const int ex = end->first;
-          const int ey = end->second;
+        if (skeleton_only && !gvd_mask_[static_cast<size_t>(nidx)]) {
+          continue;
+        }
+
+        double step_cost = (dx != 0 && dy != 0) ? std::sqrt(2.0) : 1.0;
+        if (!gvd_mask_[static_cast<size_t>(nidx)]) {
+          step_cost += kOffSkeletonStepPenalty;
+        }
+        const double clearance_deficit = std::max(
+          0.0, static_cast<double>(gvd_min_clearance_) - dist_map_[static_cast<size_t>(nidx)]);
+        step_cost += clearance_deficit * kLowClearancePenaltyScale;
+
+        const double tentative_g = g_score[static_cast<size_t>(idx0)] + step_cost;
+        if (tentative_g < g_score[static_cast<size_t>(nidx)]) {
+          came_from[static_cast<size_t>(nidx)] = idx0;
+          g_score[static_cast<size_t>(nidx)] = tentative_g;
           const double heur = std::hypot(nx - ex, ny - ey);
           open_set.push({tentative_g + heur, ++counter, nidx});
         }
       }
     }
 
-    RCLCPP_INFO(get_logger(), "GVD-guided path: A* failed");
     return std::nullopt;
+  }
+
+  std::optional<std::vector<std::pair<double, double>>> find_gvd_path(
+    const std::pair<double, double> & robot_xy,
+    const std::pair<double, double> & goal_xy)
+  {
+    get_distance_transform();
+    if (gvd_mask_.empty()) {
+      return std::nullopt;
+    }
+    const auto start = nearest_gvd_cell(robot_xy.first, robot_xy.second);
+    const auto end = nearest_gvd_cell(goal_xy.first, goal_xy.second);
+    if (!start || !end) {
+      RCLCPP_INFO(
+        get_logger(), "GVD path: no GVD cell near %s",
+        !start ? "robot" : "goal");
+      return std::nullopt;
+    }
+    if (*start == *end) {
+      return std::nullopt;
+    }
+
+    const int start_idx = index(start->first, start->second);
+    const int end_idx = index(end->first, end->second);
+    int explored = 0;
+    auto path_cells = find_cell_path(start_idx, end_idx, true, explored);
+    if (!path_cells) {
+      RCLCPP_INFO(
+        get_logger(),
+        "GVD path: skeleton disconnected after exploring %d cells, retrying with free-space bridge",
+        explored);
+      explored = 0;
+      path_cells = find_cell_path(start_idx, end_idx, false, explored);
+    }
+
+    if (!path_cells) {
+      RCLCPP_INFO(get_logger(), "GVD path: A* failed (explored %d cells)", explored);
+      return std::nullopt;
+    }
+
+    std::vector<std::pair<double, double>> path;
+    path.reserve(path_cells->size());
+    int skeleton_count = 0;
+    for (int cell : *path_cells) {
+      const int x = cell % width_;
+      const int y = cell / width_;
+      if (gvd_mask_[static_cast<size_t>(cell)]) {
+        ++skeleton_count;
+      }
+      path.push_back(gvd_world_point_for_cell(x, y));
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "GVD path: %zu cells, %d on skeleton (%d%%)",
+      path.size(), skeleton_count,
+      static_cast<int>(100 * skeleton_count / std::max<size_t>(1, path.size())));
+    return path;
   }
 
   std::vector<std::pair<double, double>> sample_waypoints(
@@ -1265,7 +1269,10 @@ private:
     }
 
     if (!accepted) {
-      RCLCPP_WARN(get_logger(), "Goal rejected by Nav2; keeping frontier and waiting for next planner tick");
+      RCLCPP_WARN(
+        get_logger(),
+        "Goal rejected by Nav2; blacklisting the current target to avoid a retry loop");
+      blacklist_current_target();
       navigating_ = false;
       prev_goal_.reset();
       record_callback_timing("goal_response_cb", started);
@@ -1291,7 +1298,10 @@ private:
         blacklist_point(current_frontier_->first, current_frontier_->second);
       }
     } else if (code == rclcpp_action::ResultCode::ABORTED) {
-      RCLCPP_WARN(get_logger(), "Navigation aborted by Nav2; keeping frontier and waiting for next planner tick");
+      RCLCPP_WARN(
+        get_logger(),
+        "Navigation aborted by Nav2; blacklisting the current target to avoid a retry loop");
+      blacklist_current_target();
     } else if (code == rclcpp_action::ResultCode::CANCELED) {
       RCLCPP_INFO(get_logger(), "Navigation cancelled");
     } else {
@@ -1359,6 +1369,18 @@ private:
   {
     if (current_goal_) {
       blacklist_point(current_goal_->first, current_goal_->second);
+    }
+  }
+
+  void blacklist_current_target()
+  {
+    if (current_goal_ && !is_blacklisted(current_goal_->first, current_goal_->second)) {
+      blacklist_point(current_goal_->first, current_goal_->second);
+    }
+    if (current_frontier_ &&
+      !is_blacklisted(current_frontier_->first, current_frontier_->second))
+    {
+      blacklist_point(current_frontier_->first, current_frontier_->second);
     }
   }
 
@@ -1591,8 +1613,12 @@ private:
   void clear_map_caches()
   {
     dist_map_.clear();
-    nearest_obstacle_.clear();
+    label_map_.clear();
     gvd_mask_.clear();
+    site_xs_.clear();
+    site_ys_.clear();
+    gvd_world_x_.clear();
+    gvd_world_y_.clear();
     cached_gvd_marker_valid_ = false;
   }
 
@@ -1623,10 +1649,11 @@ private:
 
   double stamp_age_seconds(const builtin_interfaces::msg::Time & stamp) const
   {
-    if (get_clock()->now().nanoseconds() <= 0) {
+    const auto now_time = now();
+    if (now_time.nanoseconds() <= 0) {
       return 0.0;
     }
-    return std::max(0.0, (now() - rclcpp::Time(stamp)).seconds());
+    return std::max(0.0, (now_time - rclcpp::Time(stamp)).seconds());
   }
 
   void record_timing(const std::string & stage, const Clock::time_point & started)
@@ -1775,7 +1802,7 @@ private:
   double profile_log_interval_{15.0};
   bool profile_callbacks_{false};
   double profile_callback_log_interval_{10.0};
-  bool require_live_map_{false};
+  bool require_live_map_{true};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr live_map_ready_sub_;
@@ -1814,10 +1841,12 @@ private:
   GoalHandleNavThrough::SharedPtr nav_through_goal_handle_;
 
   std::vector<double> dist_map_;
-  std::vector<int> nearest_obstacle_;
+  std::vector<int> label_map_;
   std::vector<uint8_t> gvd_mask_;
-  int gvd_site_count_{0};
-  int gvd_cell_count_{0};
+  std::vector<int> site_xs_;
+  std::vector<int> site_ys_;
+  std::vector<double> gvd_world_x_;
+  std::vector<double> gvd_world_y_;
   builtin_interfaces::msg::Time cached_map_stamp_;
 
   visualization_msgs::msg::MarkerArray cached_gvd_marker_array_;
