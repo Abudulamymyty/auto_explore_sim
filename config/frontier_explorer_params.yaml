@@ -2,10 +2,8 @@
 # Frontier Explorer Parameters
 # =============================================================================
 # BFS frontier-based autonomous explorer inspired by m-explore.
-# Searches outward from robot position, picks nearest frontier with GVD
-# clearance tiebreaking (prefers frontiers in wider corridors).
-#
-# cost = min_distance - clearance_scale * clearance_at_centroid
+# Searches outward from robot position and selects the nearest frontier
+# using Euclidean heuristic distance to the frontier centroid.
 #
 # Control:  publish Bool to 'explore/resume' to stop (false) / resume (true)
 # =============================================================================
@@ -31,26 +29,33 @@ frontier_explorer:
 
     # Minimum number of frontier cells in a cluster to be considered
     # a valid frontier. Filters noise / tiny gaps.
-    min_frontier_size: 20
+    min_frontier_size: 40
 
-    # --- GVD clearance tiebreaker ---
-    # Among roughly equidistant frontiers, prefer those in wider corridors.
-    # A frontier with 1m more clearance gets a (clearance_scale * 1) m
-    # discount on its effective distance.
-    # Set to 0.0 to disable (pure nearest-first).
+    # Kept for backward compatibility. Frontier selection is now pure
+    # nearest-first by Euclidean heuristic distance, so this value is ignored.
     clearance_scale: 0.2
 
-    # If no movement > 0.3 m within this many seconds, cancel goal
-    # and blacklist the frontier.
-    progress_timeout: 30.0
+    # Only refresh frontier candidates that are near the robot. This keeps
+    # frontier updates local while a locked frontier target stays unchanged.
+    # Set <= 0 to disable the distance gate.
+    frontier_update_radius: 3.0
+
+    # If no movement > 0.3 m within this many seconds during navigation,
+    # treat it as stuck. The explorer first tries to recover back to a GVD
+    # point, then replans toward the locked frontier.
+    progress_timeout: 5.0
 
     # Blacklisted frontier expiry time (seconds). After this long the
     # frontier can be targeted again.
     blacklist_timeout: 120.0
 
+    # Do not give up on a frontier after the first missing-anchor / missing-path
+    # result. Only blacklist it after this many consecutive GVD planning failures.
+    frontier_plan_retry_limit: 3
+
     # Radius around a blacklisted point (m). Any frontier centroid
     # within this radius is also considered blacklisted.
-    blacklist_radius: 0.5
+    blacklist_radius: 1.0
 
     # When true, the robot navigates back to its starting pose after
     # all frontiers are exhausted.
@@ -67,7 +72,29 @@ frontier_explorer:
     # Maximum search radius (metres) when snapping a frontier goal to the
     # nearest GVD point.  If no GVD point is found within this radius,
     # the original frontier centroid is used.
-    gvd_snap_radius: 2.0
+    gvd_snap_radius: 5.0
+
+    # Accept slightly larger equal-distance error and a looser site-direction
+    # test so more free cells can qualify as GVD cells on a discrete grid.
+    gvd_distance_tolerance_cells: 4.0
+    gvd_max_site_direction_dot: 0.7
+
+    # Keep the robot on the GVD "railway". When false, a frontier is only
+    # accepted if there is a continuous on-skeleton GVD path to its snapped
+    # anchor. When true, the planner may bridge disconnected skeleton pieces
+    # through free space.
+    allow_gvd_bridge: false
+
+    # Kept for compatibility. In the current strict GVD-track mode, frontier
+    # exploration does not leave the GVD for a direct frontier goal.
+    allow_safe_direct_frontier_nav: false
+    direct_frontier_min_clearance_cells: 6.0
+
+    # Reserved compatibility knobs from the earlier heuristic GVD-chain
+    # fallback. The planner now prefers either a same-component GVD route or
+    # a direct hop to an entry point on the target-side GVD component.
+    gvd_heuristic_chain_sample_step: 0.4
+    gvd_heuristic_chain_max_offset: 5.0
 
     # Publish GVD skeleton as LINE_LIST markers on /explore/gvd
     visualize_gvd: true
@@ -76,3 +103,53 @@ frontier_explorer:
     # These reduce marker publication load while preserving visualization.
     gvd_marker_publish_every: 3
     gvd_marker_stride: 2
+
+    # Subsample the raw GVD path using original GVD points only. Smaller
+    # spacing keeps more sequential NavigateThroughPoses targets on the
+    # skeleton instead of skipping over long gaps.
+    gvd_waypoint_spacing: 0.6
+
+    # Kept for compatibility. GVD navigation targets are no longer smoothed
+    # so every dispatched waypoint stays on an original GVD point.
+    gvd_waypoint_smoothing_passes: 0
+
+    # Baseline length for one dispatched GVD segment. The explorer now adapts
+    # this online: if the GVD route looks stable it can expand all the way to
+    # the current GVD endpoint, and if feedback looks jerky it shrinks toward
+    # the minimum below.
+    gvd_segment_length: 3.0
+    gvd_segment_length_min: 0.4
+    gvd_segment_length_max: 6.0
+
+    # If Nav2 feedback keeps moving without making enough goal progress for
+    # several consecutive samples, treat that as a jerky GVD-following phase
+    # and force the next replan to use a shorter segment.
+    gvd_jerk_feedback_threshold: 5
+    gvd_jerk_progress_epsilon: 0.03
+    gvd_jerk_replan_cooldown: 2.0
+
+    # If the robot gets stuck while following a GVD segment, first try to
+    # recover to a point on the active GVD segment. If that is unavailable,
+    # fall back to the nearest reachable GVD point within this radius, then
+    # replan toward the same locked frontier.
+    stuck_recovery_gvd_radius: 3.0
+
+    # While navigating to a selected frontier, keep rebuilding the GVD path
+    # from the current pose whenever the map updates, but keep the same locked
+    # frontier target even if that frontier disappears from the current local
+    # frontier set. This helps when the distant part of the skeleton changes
+    # as SLAM expands.
+    replan_while_navigating: true
+
+    # Minimum time between two in-motion GVD replans (seconds).
+    gvd_replan_interval: 3.0
+
+    # Do not refresh the active path if the robot is already very close to
+    # the current goal, to avoid thrashing near the end of the route.
+    gvd_replan_min_remaining_distance: 0.8
+
+    # If the robot has already crossed beyond the last waypoint of the active
+    # GVD segment, do not force it to flip around and touch that old waypoint.
+    # Instead, cancel the current segment and replan from the current pose.
+    gvd_goal_pass_projection_margin: 0.08
+    gvd_goal_pass_lateral_tolerance: 0.35

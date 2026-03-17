@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -32,6 +33,29 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node, SetParameter
 from launch_ros.descriptions import ParameterFile
 from nav2_common.launch import RewrittenYaml
+
+
+def patch_robot_urdf(robot_description, sim_dir):
+    mesh_dir = os.path.join(sim_dir, 'models', 'turtlebot3_model', 'meshes')
+    return robot_description.replace(
+        'package://nav2_minimal_tb3_sim/models/',
+        f'file://{mesh_dir}/',
+    )
+
+
+def patch_robot_sdf_xacro(robot_sdf_path, sim_dir):
+    with open(robot_sdf_path, 'r', encoding='utf-8') as file:
+        robot_sdf = file.read()
+
+    patched_sdf = robot_sdf.replace(
+        'package://nav2_minimal_tb3_sim/',
+        f'file://{sim_dir}/',
+    )
+    patched_sdf_path = os.path.join(
+        tempfile.gettempdir(), 'auto_explore_sim_gz_waffle_patched.sdf.xacro')
+    with open(patched_sdf_path, 'w', encoding='utf-8') as file:
+        file.write(patched_sdf)
+    return patched_sdf_path
 
 
 def generate_launch_description():
@@ -97,10 +121,13 @@ def generate_launch_description():
 
     # ── Robot URDF / SDF ─────────────────────────────────────────────────
     urdf_file = os.path.join(sim_dir, 'urdf', 'turtlebot3_waffle.urdf')
-    with open(urdf_file, 'r') as f:
-        robot_description = f.read()
+    with open(urdf_file, 'r', encoding='utf-8') as file:
+        robot_description = patch_robot_urdf(file.read(), sim_dir)
 
-    robot_sdf = os.path.join(sim_dir, 'urdf', 'gz_waffle.sdf.xacro')
+    robot_sdf = patch_robot_sdf_xacro(
+        os.path.join(sim_dir, 'urdf', 'gz_waffle.sdf.xacro'),
+        sim_dir,
+    )
 
     stdout_linebuf_envvar = SetEnvironmentVariable(
         'RCUTILS_LOGGING_BUFFERED_STREAM', '1')

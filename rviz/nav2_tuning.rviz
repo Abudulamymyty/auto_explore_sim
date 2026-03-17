@@ -40,7 +40,7 @@ Visualization Manager:
         Value: /map
       Update Topic:
         Value: /map_updates
-      Alpha: 0.7
+      Alpha: 0.45
       Draw Behind: true
 
     - Class: rviz_default_plugins/Map
@@ -48,7 +48,7 @@ Visualization Manager:
       Enabled: true
       Topic:
         Value: /global_costmap/costmap
-      Alpha: 0.3
+      Alpha: 0.75
       Color Scheme: costmap
 
     - Class: rviz_default_plugins/Map
@@ -56,7 +56,7 @@ Visualization Manager:
       Enabled: true
       Topic:
         Value: /local_costmap/costmap
-      Alpha: 0.3
+      Alpha: 0.9
       Color Scheme: costmap
 
     - Class: rviz_default_plugins/LaserScan
