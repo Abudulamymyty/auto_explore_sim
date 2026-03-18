@@ -625,8 +625,85 @@ GvdSnapResult GvdMap::snap_to_gvd(
       }
       const auto [wx, wy] = gvd.world_point(grid, x, y);
       const double cand_to_frontier = std::hypot(wx - point.first, wy - point.second);
+      if (cand_to_frontier > snap_radius_m) {
+        continue;
+      }
       if (cand_to_frontier < best_dist) {
         best_dist = cand_to_frontier;
+        result.point = {wx, wy};
+        result.found = true;
+      }
+    }
+  }
+
+  if (result.found) {
+    result.moved = std::hypot(
+      result.point.first - point.first, result.point.second - point.second) > 1e-3;
+  }
+
+  return result;
+}
+
+GvdSnapResult GvdMap::snap_to_same_component_gvd(
+  const GridMapView & grid,
+  const GvdData & gvd,
+  const std::pair<double, double> & robot_xy,
+  const std::pair<double, double> & point,
+  double snap_radius_m)
+{
+  GvdSnapResult result{point, false, false};
+  if (!grid.valid() || gvd.empty() || gvd.component_map.empty()) {
+    return result;
+  }
+
+  const auto robot_cell = nearest_gvd_cell(
+    grid, gvd, robot_xy.first, robot_xy.second, std::max(1.5, snap_radius_m));
+  if (!robot_cell) {
+    return result;
+  }
+
+  const int robot_idx = grid.index(robot_cell->first, robot_cell->second);
+  const int robot_component = gvd.component_map[static_cast<size_t>(robot_idx)];
+  if (robot_component < 0) {
+    return result;
+  }
+
+  int px = static_cast<int>((point.first - grid.origin_x) / grid.resolution);
+  int py = static_cast<int>((point.second - grid.origin_y) / grid.resolution);
+  px = std::clamp(px, 0, grid.width - 1);
+  py = std::clamp(py, 0, grid.height - 1);
+
+  const int point_idx = grid.index(px, py);
+  if (
+    gvd.mask[static_cast<size_t>(point_idx)] &&
+    gvd.component_map[static_cast<size_t>(point_idx)] == robot_component)
+  {
+    result.point = gvd.world_point(grid, px, py);
+    result.found = true;
+    result.moved = std::hypot(
+      result.point.first - point.first, result.point.second - point.second) > 1e-3;
+    return result;
+  }
+
+  const int max_cells = static_cast<int>(snap_radius_m / grid.resolution);
+  double best_dist = std::numeric_limits<double>::infinity();
+  for (int y = std::max(0, py - max_cells); y <= std::min(grid.height - 1, py + max_cells); ++y) {
+    for (int x = std::max(0, px - max_cells); x <= std::min(grid.width - 1, px + max_cells); ++x) {
+      const int idx = grid.index(x, y);
+      if (
+        !gvd.mask[static_cast<size_t>(idx)] ||
+        gvd.component_map[static_cast<size_t>(idx)] != robot_component)
+      {
+        continue;
+      }
+
+      const auto [wx, wy] = gvd.world_point(grid, x, y);
+      const double candidate_distance = std::hypot(wx - point.first, wy - point.second);
+      if (candidate_distance > snap_radius_m) {
+        continue;
+      }
+      if (candidate_distance < best_dist) {
+        best_dist = candidate_distance;
         result.point = {wx, wy};
         result.found = true;
       }

@@ -94,6 +94,13 @@ public:
     const std::pair<double, double> & point,
     double snap_radius_m);
 
+  static GvdSnapResult snap_to_same_component_gvd(
+    const GridMapView & grid,
+    const GvdData & gvd,
+    const std::pair<double, double> & robot_xy,
+    const std::pair<double, double> & point,
+    double snap_radius_m);
+
   static std::optional<GvdPathResult> find_path(
     const GridMapView & grid,
     const GvdData & gvd,

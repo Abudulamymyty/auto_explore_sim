@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,12 @@ struct BlacklistedPoint
   double x{0.0};
   double y{0.0};
   rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+};
+
+struct CompletedPoint
+{
+  double x{0.0};
+  double y{0.0};
 };
 
 inline bool same_stamp(
@@ -148,6 +155,7 @@ public:
     declare_parameter("replan_while_navigating", true);
     declare_parameter("gvd_replan_interval", 3.0);
     declare_parameter("gvd_replan_min_remaining_distance", 0.8);
+    declare_parameter("gvd_goal_pass_max_goal_distance", 0.45);
     declare_parameter("gvd_goal_pass_projection_margin", 0.08);
     declare_parameter("gvd_goal_pass_lateral_tolerance", 0.35);
     declare_parameter("profile_timing", false);
@@ -217,6 +225,8 @@ public:
     gvd_replan_interval_ = get_parameter("gvd_replan_interval").as_double();
     gvd_replan_min_remaining_distance_ =
       get_parameter("gvd_replan_min_remaining_distance").as_double();
+    gvd_goal_pass_max_goal_distance_ = std::max(
+      0.05, get_parameter("gvd_goal_pass_max_goal_distance").as_double());
     gvd_goal_pass_projection_margin_ = std::max(
       0.01, get_parameter("gvd_goal_pass_projection_margin").as_double());
     gvd_goal_pass_lateral_tolerance_ = std::max(
@@ -465,11 +475,18 @@ private:
     gvd_low_progress_feedback_count_ = 0;
   }
 
+  void clear_waiting_for_usable_frontier_on_current_map()
+  {
+    waiting_for_usable_frontier_on_current_map_ = false;
+    usable_frontier_wait_map_hash_ = 0;
+    usable_frontier_wait_map_hash_valid_ = false;
+  }
+
   bool has_passed_active_gvd_goal(const std::pair<double, double> & robot_xy) const
   {
     if (
       active_navigation_mode_ != ActiveNavigationMode::GvdWaypoints ||
-      active_waypoints_.size() < 2U || !current_goal_)
+      active_waypoints_.size() < 2U || !current_goal_ || !last_feedback_goal_distance_)
     {
       return false;
     }
@@ -480,6 +497,12 @@ private:
     const double segment_dy = goal.second - previous.second;
     const double segment_length = std::hypot(segment_dx, segment_dy);
     if (segment_length <= 1e-6) {
+      return false;
+    }
+
+    const double goal_distance = std::hypot(
+      robot_xy.first - goal.first, robot_xy.second - goal.second);
+    if (goal_distance > gvd_goal_pass_max_goal_distance_) {
       return false;
     }
 
@@ -496,6 +519,142 @@ private:
     return lateral_offset <= gvd_goal_pass_lateral_tolerance_;
   }
 
+  double frontier_match_radius() const
+  {
+    return std::max(1.0, 2.0 * blacklist_radius_);
+  }
+
+  double frontier_completion_radius() const
+  {
+    return std::max(blacklist_radius_, 1.0);
+  }
+
+  bool frontier_matches_point(const Frontier & frontier, double x, double y) const
+  {
+    return std::hypot(frontier.centroid_x - x, frontier.centroid_y - y) <= frontier_match_radius();
+  }
+
+  bool frontiers_match(const Frontier & lhs, const Frontier & rhs) const
+  {
+    return frontier_matches_point(lhs, rhs.centroid_x, rhs.centroid_y);
+  }
+
+  void refresh_frontier_metrics(
+    Frontier * frontier, const std::pair<double, double> & robot_xy) const
+  {
+    frontier->heuristic_distance = std::hypot(
+      frontier->centroid_x - robot_xy.first, frontier->centroid_y - robot_xy.second);
+    frontier->min_distance = frontier->heuristic_distance;
+    frontier->cost = frontier->heuristic_distance;
+  }
+
+  bool goal_reaches_frontier(
+    const std::pair<double, double> & goal,
+    const std::pair<double, double> & frontier) const
+  {
+    return std::hypot(goal.first - frontier.first, goal.second - frontier.second) <=
+           frontier_completion_radius();
+  }
+
+  void forget_known_frontier(double x, double y)
+  {
+    known_frontiers_.erase(
+      std::remove_if(
+        known_frontiers_.begin(), known_frontiers_.end(),
+        [&](const Frontier & frontier) {
+          return frontier_matches_point(frontier, x, y);
+        }),
+      known_frontiers_.end());
+  }
+
+  void prune_known_frontiers()
+  {
+    known_frontiers_.erase(
+      std::remove_if(
+        known_frontiers_.begin(), known_frontiers_.end(),
+        [&](const Frontier & frontier) {
+          return is_blacklisted(frontier.centroid_x, frontier.centroid_y) ||
+                 is_completed(frontier.centroid_x, frontier.centroid_y);
+        }),
+      known_frontiers_.end());
+  }
+
+  void refresh_known_frontiers(
+    const std::vector<Frontier> & observed_frontiers,
+    const std::pair<double, double> & robot_xy)
+  {
+    prune_known_frontiers();
+    for (const auto & frontier : observed_frontiers) {
+      if (is_blacklisted(frontier.centroid_x, frontier.centroid_y) ||
+        is_completed(frontier.centroid_x, frontier.centroid_y))
+      {
+        continue;
+      }
+
+      bool matched_existing = false;
+      for (auto & known_frontier : known_frontiers_) {
+        if (!frontiers_match(known_frontier, frontier)) {
+          continue;
+        }
+        known_frontier = frontier;
+        matched_existing = true;
+        break;
+      }
+      if (!matched_existing) {
+        known_frontiers_.push_back(frontier);
+      }
+    }
+
+    for (auto & frontier : known_frontiers_) {
+      refresh_frontier_metrics(&frontier, robot_xy);
+    }
+    std::sort(
+      known_frontiers_.begin(), known_frontiers_.end(),
+      [](const Frontier & lhs, const Frontier & rhs) {
+        if (lhs.heuristic_distance != rhs.heuristic_distance) {
+          return lhs.heuristic_distance < rhs.heuristic_distance;
+        }
+        if (lhs.min_distance != rhs.min_distance) {
+          return lhs.min_distance < rhs.min_distance;
+        }
+        return lhs.size > rhs.size;
+      });
+  }
+
+  std::vector<Frontier> build_cached_frontier_candidates(
+    const std::vector<Frontier> & observed_frontiers,
+    const std::pair<double, double> & robot_xy) const
+  {
+    std::vector<Frontier> candidates;
+    for (const auto & known_frontier : known_frontiers_) {
+      const bool already_present = std::any_of(
+        observed_frontiers.begin(), observed_frontiers.end(),
+        [&](const Frontier & candidate) {
+          return frontiers_match(candidate, known_frontier);
+        });
+      if (already_present) {
+        continue;
+      }
+
+      Frontier cached_frontier = known_frontier;
+      refresh_frontier_metrics(&cached_frontier, robot_xy);
+      candidates.push_back(cached_frontier);
+    }
+
+    std::sort(
+      candidates.begin(), candidates.end(),
+      [](const Frontier & lhs, const Frontier & rhs) {
+        if (lhs.heuristic_distance != rhs.heuristic_distance) {
+          return lhs.heuristic_distance < rhs.heuristic_distance;
+        }
+        if (lhs.min_distance != rhs.min_distance) {
+          return lhs.min_distance < rhs.min_distance;
+        }
+        return lhs.size > rhs.size;
+      });
+    return candidates;
+  }
+
   bool maybe_advance_past_active_gvd_goal(const std::pair<double, double> & robot_xy)
   {
     if (
@@ -508,7 +667,7 @@ private:
     const auto goal = active_waypoints_.back();
     RCLCPP_INFO(
       get_logger(),
-      "Robot has already passed the active GVD segment goal (%.2f, %.2f); cancelling this segment and replanning from the current pose",
+      "Robot has already passed the active GVD segment goal (%.2f, %.2f) while staying close to it; cancelling this segment and replanning from the current pose",
       goal.first, goal.second);
 
     ++goal_seq_;
@@ -566,8 +725,8 @@ private:
     FrontierNavigationPlan plan;
     plan.frontier = frontier_xy;
 
-    const auto snapped = auto_explore_sim::GvdMap::snap_to_gvd(
-      grid, gvd_data, frontier_xy, gvd_config_.snap_radius);
+    const auto snapped = auto_explore_sim::GvdMap::snap_to_same_component_gvd(
+      grid, gvd_data, robot_xy, frontier_xy, gvd_config_.snap_radius);
     plan.has_gvd_anchor = snapped.found;
     plan.anchor = snapped.point;
     plan.goal = plan.anchor;
@@ -614,11 +773,56 @@ private:
     return plan;
   }
 
+  std::optional<FrontierNavigationPlan> build_direct_frontier_navigation_plan(
+    const std::pair<double, double> & robot_xy,
+    const std::pair<double, double> & frontier_xy)
+  {
+    if (!allow_safe_direct_frontier_nav_) {
+      return std::nullopt;
+    }
+
+    const auto grid = make_grid_view();
+    const auto & gvd_data = get_gvd_data();
+    if (!grid.valid() || gvd_data.dist_map.empty()) {
+      return std::nullopt;
+    }
+
+    const auto direct_path = auto_explore_sim::GvdMap::find_safe_direct_goal(
+      grid, gvd_data, robot_xy, frontier_xy, gvd_config_, kDirectFrontierGoalSearchRadius);
+    if (!direct_path ||
+      direct_path->min_clearance_cells < direct_frontier_min_clearance_cells_)
+    {
+      return std::nullopt;
+    }
+
+    FrontierNavigationPlan plan;
+    plan.frontier = frontier_xy;
+    plan.anchor = frontier_xy;
+    plan.goal = direct_path->goal;
+    plan.mode = FrontierPlanMode::DirectGoal;
+    plan.direct_goal_is_frontier = true;
+    plan.direct_goal_adjusted = direct_path->adjusted_goal;
+    plan.direct_path_min_clearance_cells = direct_path->min_clearance_cells;
+    plan.direct_path_explored_cells = direct_path->explored_cells;
+    plan.segment_reaches_anchor = true;
+    return plan;
+  }
+
   void log_frontier_navigation_plan(
     const FrontierNavigationPlan & plan,
     bool refreshing_existing_goal) const
   {
     const char * prefix = refreshing_existing_goal ? "Refreshing navigation" : "Planning";
+    if (plan.mode == FrontierPlanMode::DirectGoal) {
+      RCLCPP_INFO(
+        get_logger(),
+        "%s: no usable GVD route remained, falling back to direct frontier navigation -> "
+        "(%.2f, %.2f), path min clearance %.2f cells",
+        prefix,
+        plan.goal.first, plan.goal.second,
+        plan.direct_path_min_clearance_cells);
+      return;
+    }
     if (!plan.has_gvd_anchor) {
       RCLCPP_INFO(
         get_logger(),
@@ -696,13 +900,6 @@ private:
     const FrontierNavigationPlan & plan,
     bool refreshing_existing_goal)
   {
-    if (plan.mode != FrontierPlanMode::GvdWaypoints) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Refusing to dispatch a frontier plan that leaves the GVD track");
-      return;
-    }
-
     current_frontier_ = plan.frontier;
     current_frontier_anchor_ = plan.has_gvd_anchor ? std::optional<std::pair<double, double>>(plan.anchor) :
       std::optional<std::pair<double, double>>(plan.goal);
@@ -716,18 +913,34 @@ private:
       cancel_current_goal();
     }
 
-    if (!plan.using_gvd_path || plan.waypoints.size() < 2U) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Refusing to dispatch a GVD waypoint plan without a continuous GVD-guided path");
+    if (plan.mode == FrontierPlanMode::GvdWaypoints) {
+      if (!plan.using_gvd_path || plan.waypoints.size() < 2U) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Refusing to dispatch a GVD waypoint plan without a continuous GVD-guided path");
+        return;
+      }
+
+      active_navigation_mode_ = ActiveNavigationMode::GvdWaypoints;
+      active_waypoints_ = plan.waypoints;
+      active_gvd_plan_quality_good_ = plan.path_quality_good;
+      publish_path_markers(plan.waypoints);
+      navigate_through_poses(plan.waypoints);
       return;
     }
 
-    active_navigation_mode_ = ActiveNavigationMode::GvdWaypoints;
-    active_waypoints_ = plan.waypoints;
-    active_gvd_plan_quality_good_ = plan.path_quality_good;
-    publish_path_markers(plan.waypoints);
-    navigate_through_poses(plan.waypoints);
+    if (plan.mode == FrontierPlanMode::DirectGoal) {
+      active_navigation_mode_ = ActiveNavigationMode::SingleGoal;
+      active_waypoints_.clear();
+      active_gvd_plan_quality_good_ = false;
+      publish_path_markers({plan.goal});
+      navigate_to(plan.goal.first, plan.goal.second);
+      return;
+    }
+
+    RCLCPP_WARN(
+      get_logger(),
+      "Refusing to dispatch a frontier plan with an unsupported mode");
   }
 
   void maybe_refresh_navigation(const std::pair<double, double> & robot_xy)
@@ -765,54 +978,24 @@ private:
       }
     }
 
-    auto refreshed_plan = build_frontier_navigation_plan(
-      robot_xy, *current_frontier_, current_frontier_missing_from_search_);
     last_gvd_replan_time_ = now();
-    if (!refreshed_plan) {
-      force_gvd_replan_ = false;
-      return;
-    }
-    const bool has_gvd_plan =
-      refreshed_plan->mode == FrontierPlanMode::GvdWaypoints &&
-      refreshed_plan->using_gvd_path &&
-      refreshed_plan->waypoints.size() >= 2U;
-    if (!has_gvd_plan)
-    {
-      const auto failure = note_frontier_plan_failure(
-        current_frontier_->first, current_frontier_->second);
-      if (failure.advanced) {
-        RCLCPP_INFO(
-          get_logger(),
-          "GVD refresh trigger fired (%s%s), but the locked frontier still has no usable same-component GVD route; keeping current route and retrying later (%d/%d)",
-          map_updated ? "map update" : "",
-          moved_beyond_snap_radius ? (map_updated ? ", moved beyond gvd_snap_radius" : "moved beyond gvd_snap_radius") : "",
-          failure.count, frontier_plan_retry_limit_);
-      } else {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 5000,
-          "GVD refresh trigger fired again for the locked frontier, but the map content is unchanged; keeping the current route and waiting for a real GVD update (%d/%d)",
-          failure.count, frontier_plan_retry_limit_);
-      }
-      active_plan_map_hash_ = map_content_hash_;
-      active_plan_map_hash_valid_ = map_content_hash_valid_;
-      active_plan_robot_xy_ = robot_xy;
-      force_gvd_replan_ = false;
-      return;
-    }
 
-    clear_frontier_plan_failures(
-      current_frontier_->first, current_frontier_->second);
-    RCLCPP_INFO(
-      get_logger(),
-      "%s%s%s - recomputing the navigation plan to the active frontier",
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "%s%s%s - keeping the current GVD segment and deferring replanning until this segment finishes",
       map_updated ? "Map updated" : "",
-      moved_beyond_snap_radius ? (map_updated ? ", robot moved beyond gvd_snap_radius" : "Robot moved beyond gvd_snap_radius") : "",
+      moved_beyond_snap_radius ?
+      (map_updated ? ", robot moved beyond gvd_snap_radius" : "Robot moved beyond gvd_snap_radius") :
+      "",
       forced_shorter_segment ?
       ((map_updated || moved_beyond_snap_radius) ? ", adaptive segment shortening requested" :
-      "Adaptive segment shortening requested") : "");
-    log_frontier_navigation_plan(*refreshed_plan, true);
+      "Adaptive segment shortening requested") :
+      "");
+
+    active_plan_map_hash_ = map_content_hash_;
+    active_plan_map_hash_valid_ = map_content_hash_valid_;
+    active_plan_robot_xy_ = robot_xy;
     force_gvd_replan_ = false;
-    dispatch_frontier_navigation_plan(*refreshed_plan, true);
   }
 
   void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -1028,6 +1211,16 @@ private:
       return;
     }
 
+    if (!current_frontier_ && waiting_for_usable_frontier_on_current_map_) {
+      if (
+        usable_frontier_wait_map_hash_valid_ && map_content_hash_valid_ &&
+        usable_frontier_wait_map_hash_ == map_content_hash_)
+      {
+        return;
+      }
+      clear_waiting_for_usable_frontier_on_current_map();
+    }
+
     if (!initial_pose_) {
       initial_pose_ = robot_xy;
       RCLCPP_INFO(
@@ -1082,14 +1275,25 @@ private:
     }
 
     prune_blacklist();
-    std::vector<Frontier> valid;
-    valid.reserve(frontiers.size());
-    for (const auto & frontier : frontiers) {
-      if (!is_blacklisted(frontier.centroid_x, frontier.centroid_y)) {
-        valid.push_back(frontier);
-      }
-    }
-    if (valid.empty() && !current_frontier_) {
+    refresh_known_frontiers(frontiers, *robot_xy);
+    const auto filter_frontiers =
+      [&](const std::vector<Frontier> & candidates) {
+        std::vector<Frontier> filtered;
+        filtered.reserve(candidates.size());
+        for (const auto & frontier : candidates) {
+          if (
+            !is_blacklisted(frontier.centroid_x, frontier.centroid_y) &&
+            !is_completed(frontier.centroid_x, frontier.centroid_y))
+          {
+            filtered.push_back(frontier);
+          }
+        }
+        return filtered;
+      };
+    std::vector<Frontier> observed_valid = filter_frontiers(frontiers);
+    std::vector<Frontier> cached_valid = filter_frontiers(
+      build_cached_frontier_candidates(frontiers, *robot_xy));
+    if (observed_valid.empty() && cached_valid.empty() && !current_frontier_) {
       if (!blacklisted_.empty()) {
         if (!waiting_for_new_map_after_blacklist_reset_) {
           waiting_for_new_map_after_blacklist_reset_ = true;
@@ -1118,10 +1322,12 @@ private:
         blacklist_reset_wait_map_hash_valid_ = false;
         blacklisted_.clear();
         frontier_plan_failures_.clear();
+        frontier_execution_failures_.clear();
         frontier_plan_failure_hashes_.clear();
-        valid = frontiers;
+        observed_valid = filter_frontiers(frontiers);
+        cached_valid = filter_frontiers(build_cached_frontier_candidates(frontiers, *robot_xy));
       }
-      if (valid.empty()) {
+      if (observed_valid.empty() && cached_valid.empty()) {
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 5000,
           "All frontiers are currently blacklisted - waiting for blacklist expiry");
@@ -1132,7 +1338,10 @@ private:
     auto gvd_started = Clock::now();
     std::optional<Frontier> selected_frontier;
     std::optional<FrontierNavigationPlan> selected_plan;
+    std::optional<Frontier> direct_fallback_frontier;
+    std::optional<FrontierNavigationPlan> direct_fallback_plan;
     bool waiting_on_locked_frontier = false;
+    std::unordered_set<std::string> attempted_frontier_keys;
     const auto make_locked_frontier =
       [&](const std::optional<Frontier> & observed_frontier) -> Frontier {
         Frontier locked_frontier;
@@ -1149,15 +1358,37 @@ private:
         }
         return locked_frontier;
       };
+    const auto try_locked_direct_fallback =
+      [&](const Frontier & locked_frontier) -> bool {
+        auto direct_plan = build_direct_frontier_navigation_plan(
+          *robot_xy, {locked_frontier.centroid_x, locked_frontier.centroid_y});
+        if (!direct_plan) {
+          return false;
+        }
+        clear_frontier_plan_failures(locked_frontier.centroid_x, locked_frontier.centroid_y);
+        selected_frontier = locked_frontier;
+        selected_plan = std::move(direct_plan);
+        waiting_on_locked_frontier = false;
+        RCLCPP_INFO(
+          get_logger(),
+          "Locked frontier currently has no usable GVD route; falling back to direct navigation toward (%.2f, %.2f)",
+          locked_frontier.centroid_x, locked_frontier.centroid_y);
+        return true;
+      };
 
     if (current_frontier_ &&
-      is_blacklisted(current_frontier_->first, current_frontier_->second))
+      (is_blacklisted(current_frontier_->first, current_frontier_->second) ||
+      is_completed(current_frontier_->first, current_frontier_->second)))
     {
       current_frontier_.reset();
       current_frontier_missing_from_search_ = false;
     }
 
     auto try_select_frontier = [&](const Frontier & frontier) -> bool {
+        const std::string key = frontier_key(frontier.centroid_x, frontier.centroid_y);
+        if (!attempted_frontier_keys.insert(key).second) {
+          return false;
+        }
         auto candidate_plan = build_frontier_navigation_plan(
           *robot_xy, {frontier.centroid_x, frontier.centroid_y});
         if (!candidate_plan) {
@@ -1167,28 +1398,61 @@ private:
           return false;
         }
         if (!candidate_plan->has_gvd_anchor) {
-          handle_frontier_plan_failure(
+          if (!direct_fallback_plan) {
+            auto direct_plan = build_direct_frontier_navigation_plan(
+              *robot_xy, {frontier.centroid_x, frontier.centroid_y});
+            if (direct_plan) {
+              direct_fallback_frontier = frontier;
+              direct_fallback_plan = std::move(direct_plan);
+            }
+          }
+          RCLCPP_INFO(
+            get_logger(),
+            "Skipping frontier (%.2f, %.2f): no usable GVD anchor within snap radius; %s",
             frontier.centroid_x, frontier.centroid_y,
-            "no usable GVD anchor within snap radius");
+            direct_fallback_plan ? "keeping direct navigation as a fallback" :
+            "keeping it for a future GVD update");
           return false;
         }
         if (!candidate_plan->using_gvd_path || candidate_plan->waypoints.size() < 2U) {
-          handle_frontier_plan_failure(
+          if (!direct_fallback_plan) {
+            auto direct_plan = build_direct_frontier_navigation_plan(
+              *robot_xy, {frontier.centroid_x, frontier.centroid_y});
+            if (direct_plan) {
+              direct_fallback_frontier = frontier;
+              direct_fallback_plan = std::move(direct_plan);
+            }
+          }
+          RCLCPP_INFO(
+            get_logger(),
+            "Skipping frontier (%.2f, %.2f): no same-component GVD route to the snapped anchor; %s",
             frontier.centroid_x, frontier.centroid_y,
-            "no same-component GVD route to the snapped anchor");
+            direct_fallback_plan ? "keeping direct navigation as a fallback" :
+            "keeping it for a future GVD update");
           return false;
         }
         const double anchored_goal_distance = std::hypot(
           candidate_plan->goal.first - robot_xy->first,
           candidate_plan->goal.second - robot_xy->second);
         if (anchored_goal_distance < 0.3) {
+          if (!goal_reaches_frontier(
+              candidate_plan->goal, {frontier.centroid_x, frontier.centroid_y}))
+          {
+            RCLCPP_INFO(
+              get_logger(),
+              "Skipping frontier (%.2f, %.2f): current-component GVD anchor goal (%.2f, %.2f) is only %.2fm away, but it is still far from the frontier; keeping it for a future GVD update",
+              frontier.centroid_x, frontier.centroid_y,
+              candidate_plan->goal.first, candidate_plan->goal.second,
+              anchored_goal_distance);
+            return false;
+          }
           RCLCPP_INFO(
             get_logger(),
             "Skipping frontier (%.2f, %.2f): anchored GVD goal (%.2f, %.2f) is only %.2fm away",
             frontier.centroid_x, frontier.centroid_y,
             candidate_plan->goal.first, candidate_plan->goal.second,
             anchored_goal_distance);
-          blacklist_point(frontier.centroid_x, frontier.centroid_y);
+          complete_frontier(frontier.centroid_x, frontier.centroid_y);
           return false;
         }
         clear_frontier_plan_failures(frontier.centroid_x, frontier.centroid_y);
@@ -1198,7 +1462,7 @@ private:
       };
 
     if (current_frontier_) {
-      const auto matched_frontier = match_locked_frontier(valid);
+      const auto matched_frontier = match_locked_frontier(observed_valid);
       const Frontier locked_frontier = make_locked_frontier(matched_frontier);
       current_frontier_missing_from_search_ = !matched_frontier.has_value();
       if (matched_frontier) {
@@ -1219,6 +1483,9 @@ private:
       auto locked_plan = build_frontier_navigation_plan(
         *robot_xy, *current_frontier_, current_frontier_missing_from_search_);
       if (!locked_plan) {
+        if (try_locked_direct_fallback(locked_frontier)) {
+          record_timing("gvd_path_search", gvd_started);
+        } else {
         const auto failure = note_frontier_plan_failure(
           current_frontier_->first, current_frontier_->second);
         if (failure.advanced) {
@@ -1243,7 +1510,11 @@ private:
         } else {
           return;
         }
+        }
       } else if (!locked_plan->has_gvd_anchor) {
+        if (try_locked_direct_fallback(locked_frontier)) {
+          record_timing("gvd_path_search", gvd_started);
+        } else {
         const auto failure = note_frontier_plan_failure(
           current_frontier_->first, current_frontier_->second);
         if (failure.advanced) {
@@ -1270,7 +1541,11 @@ private:
         } else {
           return;
         }
+        }
       } else if (!locked_plan->using_gvd_path || locked_plan->waypoints.size() < 2U) {
+        if (try_locked_direct_fallback(locked_frontier)) {
+          record_timing("gvd_path_search", gvd_started);
+        } else {
         const auto failure = note_frontier_plan_failure(
           current_frontier_->first, current_frontier_->second);
         if (failure.advanced) {
@@ -1297,6 +1572,7 @@ private:
         } else {
           return;
         }
+        }
       } else {
         clear_frontier_plan_failures(current_frontier_->first, current_frontier_->second);
         if (current_frontier_missing_from_search_) {
@@ -1310,23 +1586,77 @@ private:
     }
 
     if (!selected_frontier || !selected_plan) {
-      for (const auto & frontier : valid) {
+      for (const auto & frontier : observed_valid) {
         if (try_select_frontier(frontier)) {
           break;
         }
       }
     }
 
+    if (!selected_frontier || !selected_plan) {
+      for (const auto & frontier : cached_valid) {
+        if (try_select_frontier(frontier)) {
+          break;
+        }
+      }
+    }
+
+    if (
+      !selected_frontier && !selected_plan && !waiting_on_locked_frontier &&
+      !current_frontier_ && frontier_search_config_.frontier_update_radius > 0.0 &&
+      !expanded_frontier_search)
+    {
+      auto global_frontier_config = frontier_search_config_;
+      global_frontier_config.frontier_update_radius = 0.0;
+      const auto global_frontiers = auto_explore_sim::FrontierSearch::search(
+        grid, *robot_xy, gvd_data.dist_map, global_frontier_config);
+      refresh_known_frontiers(global_frontiers, *robot_xy);
+      const auto global_observed_valid = filter_frontiers(global_frontiers);
+      const auto global_cached_valid = filter_frontiers(
+        build_cached_frontier_candidates(global_frontiers, *robot_xy));
+      if (!global_observed_valid.empty() || !global_cached_valid.empty()) {
+        expanded_frontier_search = true;
+        RCLCPP_INFO(
+          get_logger(),
+          "No usable nearby frontier remained after GVD anchoring; expanding search to the full explored map");
+        for (const auto & frontier : global_observed_valid) {
+          if (try_select_frontier(frontier)) {
+            break;
+          }
+        }
+        if (!selected_frontier || !selected_plan) {
+          for (const auto & frontier : global_cached_valid) {
+            if (try_select_frontier(frontier)) {
+              break;
+            }
+          }
+        }
+      }
+    }
+
     record_timing("gvd_path_search", gvd_started);
+    if ((!selected_frontier || !selected_plan) && direct_fallback_frontier && direct_fallback_plan) {
+      selected_frontier = *direct_fallback_frontier;
+      selected_plan = std::move(*direct_fallback_plan);
+      RCLCPP_INFO(
+        get_logger(),
+        "No usable GVD route was found for the current frontier set; falling back to direct navigation for frontier (%.2f, %.2f)",
+        selected_frontier->centroid_x, selected_frontier->centroid_y);
+    }
     if (!selected_frontier || !selected_plan) {
       if (waiting_on_locked_frontier) {
         return;
       }
-      RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "No usable frontier remains after GVD anchoring - waiting for map growth");
+      waiting_for_usable_frontier_on_current_map_ = true;
+      usable_frontier_wait_map_hash_ = map_content_hash_;
+      usable_frontier_wait_map_hash_valid_ = map_content_hash_valid_;
+      RCLCPP_INFO(
+        get_logger(),
+        "No usable frontier remains after evaluating the current frontier list and then the cached frontier list on this map; waiting for a real map change before retrying");
       return;
     }
+
+    clear_waiting_for_usable_frontier_on_current_map();
 
     const Frontier & best = *selected_frontier;
     current_frontier_ = std::make_pair(best.centroid_x, best.centroid_y);
@@ -1341,7 +1671,19 @@ private:
 
     if (visualize_) {
       auto marker_started = Clock::now();
-      publish_frontier_markers(valid, best);
+      auto marker_frontiers = observed_valid;
+      if (marker_frontiers.empty()) {
+        marker_frontiers = cached_valid;
+      }
+      const bool best_in_markers = std::any_of(
+        marker_frontiers.begin(), marker_frontiers.end(),
+        [&](const Frontier & frontier) {
+          return frontiers_match(frontier, best);
+        });
+      if (!best_in_markers) {
+        marker_frontiers.push_back(best);
+      }
+      publish_frontier_markers(marker_frontiers, best);
       record_timing("frontier_markers", marker_started);
     }
     if (visualize_gvd_) {
@@ -1381,6 +1723,7 @@ private:
     record_timing("plan_total", plan_started);
     ++timing_plan_counter_;
     maybe_log_timing();
+    return;
   }
 
   std::vector<std::pair<double, double>> sample_waypoints(
@@ -1500,14 +1843,13 @@ private:
       return std::nullopt;
     }
 
-    const double match_radius = std::max(1.0, 2.0 * blacklist_radius_);
     const Frontier * best = nullptr;
     double best_dist = std::numeric_limits<double>::infinity();
     for (const auto & frontier : valid) {
       const double dist = std::hypot(
         frontier.centroid_x - current_frontier_->first,
         frontier.centroid_y - current_frontier_->second);
-      if (dist < best_dist && dist <= match_radius) {
+      if (dist < best_dist && dist <= frontier_match_radius()) {
         best = &frontier;
         best_dist = dist;
       }
@@ -1777,13 +2119,18 @@ private:
         return;
       }
 
-      if (current_frontier_ && !current_segment_reaches_anchor_) {
+      if (
+        current_frontier_ &&
+        (!current_segment_reaches_anchor_ ||
+        (current_goal_ && !goal_reaches_frontier(*current_goal_, *current_frontier_))))
+      {
+        clear_frontier_execution_failures(current_frontier_->first, current_frontier_->second);
         if (!active_gvd_plan_quality_good_) {
           grow_adaptive_gvd_segment_length();
         }
         RCLCPP_INFO(
           get_logger(),
-          "Intermediate frontier step reached; recomputing the next step toward the locked frontier");
+          "Intermediate frontier anchor reached; recomputing the next step toward the locked frontier");
         navigating_ = false;
         nav_to_goal_handle_.reset();
         nav_through_goal_handle_.reset();
@@ -1795,12 +2142,30 @@ private:
 
       RCLCPP_INFO(get_logger(), "Navigation succeeded");
       if (current_frontier_) {
-        blacklist_point(current_frontier_->first, current_frontier_->second);
+        clear_frontier_execution_failures(current_frontier_->first, current_frontier_->second);
+        complete_frontier(current_frontier_->first, current_frontier_->second);
       }
     } else if (code == rclcpp_action::ResultCode::ABORTED) {
       if (active_navigation_mode_ == ActiveNavigationMode::GvdWaypoints) {
         shrink_adaptive_gvd_segment_length(
           "Nav2 aborted while following the current GVD segment");
+      }
+      if (current_frontier_) {
+        const int failure_count = note_frontier_execution_failure(
+          current_frontier_->first, current_frontier_->second);
+        if (failure_count < frontier_plan_retry_limit_) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Navigation aborted by Nav2, but the frontier had a valid dispatched plan; keeping the same frontier and replanning (%d/%d)",
+            failure_count, frontier_plan_retry_limit_);
+          navigating_ = false;
+          nav_to_goal_handle_.reset();
+          nav_through_goal_handle_.reset();
+          prev_goal_.reset();
+          clear_active_navigation_state(false);
+          record_callback_timing("navigation_result_cb", started);
+          return;
+        }
       }
       RCLCPP_WARN(
         get_logger(),
@@ -1858,6 +2223,33 @@ private:
         return;
       }
 
+      if (current_frontier_) {
+        const int failure_count = note_frontier_execution_failure(
+          current_frontier_->first, current_frontier_->second);
+        RCLCPP_WARN(
+          get_logger(),
+          "No progress for %.0fs while executing a valid frontier plan", elapsed);
+        cancel_current_goal();
+        if (failure_count < frontier_plan_retry_limit_) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Keeping the locked frontier and replanning instead of blacklisting it immediately (%d/%d)",
+            failure_count, frontier_plan_retry_limit_);
+          navigating_ = false;
+          clear_active_navigation_state(false);
+          return;
+        }
+
+        RCLCPP_WARN(
+          get_logger(),
+          "Execution retry limit reached for the locked frontier; blacklisting it (%d/%d)",
+          failure_count, frontier_plan_retry_limit_);
+        blacklist_current_target();
+        navigating_ = false;
+        clear_active_navigation_state();
+        return;
+      }
+
       RCLCPP_WARN(get_logger(), "No progress for %.0fs - cancelling goal", elapsed);
       cancel_current_goal();
       blacklist_current_goal();
@@ -1903,7 +2295,21 @@ private:
   {
     RCLCPP_INFO(get_logger(), "Blacklisting (%.2f, %.2f)", x, y);
     blacklisted_.push_back({x, y, now()});
+    forget_known_frontier(x, y);
     clear_frontier_plan_failures(x, y);
+    clear_frontier_execution_failures(x, y);
+  }
+
+  void complete_frontier(double x, double y)
+  {
+    if (is_completed(x, y)) {
+      return;
+    }
+    RCLCPP_INFO(get_logger(), "Completing frontier (%.2f, %.2f)", x, y);
+    completed_frontiers_.push_back({x, y});
+    forget_known_frontier(x, y);
+    clear_frontier_plan_failures(x, y);
+    clear_frontier_execution_failures(x, y);
   }
 
   struct FrontierFailureNote
@@ -1934,6 +2340,18 @@ private:
     const std::string key = frontier_key(x, y);
     frontier_plan_failures_.erase(key);
     frontier_plan_failure_hashes_.erase(key);
+  }
+
+  int note_frontier_execution_failure(double x, double y)
+  {
+    const std::string key = frontier_key(x, y);
+    return ++frontier_execution_failures_[key];
+  }
+
+  void clear_frontier_execution_failures(double x, double y)
+  {
+    const std::string key = frontier_key(x, y);
+    frontier_execution_failures_.erase(key);
   }
 
   void handle_frontier_plan_failure(
@@ -1972,6 +2390,16 @@ private:
   bool is_blacklisted(double x, double y) const
   {
     for (const auto & item : blacklisted_) {
+      if (std::hypot(x - item.x, y - item.y) < blacklist_radius_) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool is_completed(double x, double y) const
+  {
+    for (const auto & item : completed_frontiers_) {
       if (std::hypot(x - item.x, y - item.y) < blacklist_radius_) {
         return true;
       }
@@ -2421,6 +2849,7 @@ private:
   bool replan_while_navigating_{true};
   double gvd_replan_interval_{3.0};
   double gvd_replan_min_remaining_distance_{0.8};
+  double gvd_goal_pass_max_goal_distance_{0.45};
   double gvd_goal_pass_projection_margin_{0.08};
   double gvd_goal_pass_lateral_tolerance_{0.35};
   bool profile_timing_{false};
@@ -2464,10 +2893,12 @@ private:
   bool active_gvd_plan_quality_good_{false};
   bool force_gvd_replan_{false};
   bool waiting_for_new_map_after_blacklist_reset_{false};
+  bool waiting_for_usable_frontier_on_current_map_{false};
   bool map_content_hash_valid_{false};
   bool cached_map_hash_valid_{false};
   bool blacklist_reset_wait_map_hash_valid_{false};
   bool active_plan_map_hash_valid_{false};
+  bool usable_frontier_wait_map_hash_valid_{false};
   std::optional<std::pair<double, double>> prev_goal_;
   std::optional<std::pair<double, double>> last_robot_pos_;
   std::optional<std::pair<double, double>> last_feedback_xy_;
@@ -2480,7 +2911,10 @@ private:
   int gvd_low_progress_feedback_count_{0};
   std::vector<std::pair<double, double>> active_waypoints_;
   std::vector<BlacklistedPoint> blacklisted_;
+  std::vector<CompletedPoint> completed_frontiers_;
+  std::vector<Frontier> known_frontiers_;
   std::unordered_map<std::string, int> frontier_plan_failures_;
+  std::unordered_map<std::string, int> frontier_execution_failures_;
   std::unordered_map<std::string, std::uint64_t> frontier_plan_failure_hashes_;
 
   GoalHandleNavTo::SharedPtr nav_to_goal_handle_;
@@ -2491,6 +2925,7 @@ private:
   std::uint64_t cached_map_hash_{0};
   std::uint64_t blacklist_reset_wait_map_hash_{0};
   std::uint64_t active_plan_map_hash_{0};
+  std::uint64_t usable_frontier_wait_map_hash_{0};
   builtin_interfaces::msg::Time cached_map_stamp_;
   visualization_msgs::msg::MarkerArray cached_gvd_marker_array_;
   builtin_interfaces::msg::Time cached_gvd_marker_stamp_;
