@@ -29,7 +29,7 @@ frontier_explorer:
 
     # Minimum number of frontier cells in a cluster to be considered
     # a valid frontier. Filters noise / tiny gaps.
-    min_frontier_size: 400
+    min_frontier_size: 200
 
     # Kept for backward compatibility. Frontier selection is now pure
     # nearest-first by Euclidean heuristic distance, so this value is ignored.
@@ -51,7 +51,7 @@ frontier_explorer:
 
     # Do not give up on a frontier after the first missing-anchor / missing-path
     # result. Only blacklist it after this many consecutive GVD planning failures.
-    frontier_plan_retry_limit: 3
+    frontier_plan_retry_limit: 1
 
     # Radius around a blacklisted point (m). Any frontier centroid
     # within this radius is also considered blacklisted.

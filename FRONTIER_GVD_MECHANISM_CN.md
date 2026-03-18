@@ -157,39 +157,67 @@
 
 当前参数里：
 
-- `min_frontier_size: 400`
+- `min_frontier_size: 200`
 - `frontier_update_radius: 5.0`
 
 所以当前“当前 frontier 列表”其实是**大 frontiers + 离机器人较近的 frontiers**。
 
-### 4.5 当前列表与缓存列表
+### 4.5 从 frontier list 到 frontier state graph
 
-`FrontierExplorer` 里维护两类 frontier：
+当前实现已经不再只维护一个“frontier 缓存列表”，而是维护一个轻量的
+`frontier state graph`：
 
-1. `observed frontiers`
-   - 当前这一轮 `FrontierSearch::search()` 刚搜出来的列表
-2. `known_frontiers_`
-   - 历史见过但还没访问、也没黑名单/完成的 frontier 缓存
+1. `observed frontier nodes`
+   - 当前这一轮 `FrontierSearch::search()` 刚搜出来的 frontier 节点
+2. `cached frontier nodes`
+   - 以前见过、当前没出现在 `observed` 里，但仍然活跃的节点
+3. `node state`
+   - 每个 frontier node 还会带一个当前状态，例如：
+     - `Observed`
+     - `Deferred`
+     - `DirectFallbackReady`
+     - `Locked`
+     - `Completed`
+     - `Blacklisted`
+4. `neighbors`
+   - 当前轮被同时观测到、且空间上接近的 frontier node 会记录成邻接关系
 
-系统当前的选择顺序是：
+所以现在真正被维护的不是“一个 frontier 点数组”，而是一张：
 
-1. 先从当前 `observed frontiers` 里挑
-2. 如果都不行，再去 `known_frontiers_` 里挑
+**frontier node + frontier state + frontier adjacency**
 
-这比旧版本“当前 + 历史混起来统一排序”更合理，因为它优先使用**当前地图上的最新 frontier**。
+组成的 frontier graph。
 
-### 4.6 frontier 何时从缓存里删除
+### 4.6 当前列表、缓存列表与 graph 的关系
 
-当前不会因为 GVD 更新就删除历史 frontier。
+现在的候选 frontier 仍然分两层取：
 
-frontier 只会在以下情况被从 `known_frontiers_` 移除：
+1. 先从当前 `observed` frontier nodes 里挑
+2. 如果都不行，再去 `cached` frontier nodes 里挑
 
-- 被 `complete_frontier(...)` 标记完成
-- 被 `blacklist_point(...)` 标记黑名单
+但这两层都已经来自同一个 `frontier state graph`，不再是：
 
-这点很重要，因为它意味着：
+- 一边是 `FrontierSearch::search()` 的临时列表
+- 一边是单独维护的 `known_frontiers_`
 
-**地图/GVD 更新本身不会 wipe out 以前见过但还没访问的 frontier。**
+这样做的好处是：
+
+- frontier 的历史状态不会丢
+- 当前地图上的 frontier 仍然优先
+- 以前见过但暂时没出现在本轮观测里的 frontier，不会因为 GVD 更新就被 wipe out
+
+### 4.7 frontier 何时从 graph 中退出活跃候选
+
+GVD 更新本身不会删除历史 frontier node。
+
+frontier node 退出活跃候选，主要只有两类终态：
+
+- 被 `complete_frontier(...)` 标记为 `Completed`
+- 被 `blacklist_point(...)` 标记为 `Blacklisted`
+
+所以现在更准确的说法不是“从缓存里删掉”，而是：
+
+**frontier node 进入终态，不再参与活跃候选选择。**
 
 ## 5. GVD 构建机制
 
@@ -368,12 +396,26 @@ GVD path 不是从 frontier 本身开始，而是：
 
 ### 8.1 什么时候触发
 
+当前 direct fallback 已经不是“外面的补丁出口”，而是 `mixed planning framework`
+里的一个合法 planning mode。
+
+对每个 frontier node，系统现在都会统一评估：
+
+1. GVD anchor 是否存在
+2. same-component GVD path 是否存在
+3. direct frontier path 是否安全
+
+然后在同一个 `FrontierPlanEvaluation` 里决定：
+
+- 走 `GvdWaypoints`
+- 走 `DirectGoal`
+- 还是进入 `Deferred`
+
 当前 `build_direct_frontier_navigation_plan(...)` 只有在：
 
 1. `allow_safe_direct_frontier_nav == true`
-2. 没有可用 GVD route
-3. 存在 free-space path
-4. 这条 free-space path 的最小 clearance `>= direct_frontier_min_clearance_cells`
+2. 存在 free-space path
+3. 这条 free-space path 的最小 clearance `>= direct_frontier_min_clearance_cells`
 
 时才会返回一个 `DirectGoal` 计划。
 
@@ -386,15 +428,15 @@ GVD path 不是从 frontier 本身开始，而是：
 
 如果日志是：
 
-- `no same-component GVD route to the snapped anchor; keeping it for a future GVD update`
+- `... keeping it for a future mixed-plan update`
 
 而不是：
 
-- `keeping direct navigation as a fallback`
+- `... prefers direct fallback ...`
 
 那就说明：
 
-**这个 frontier 的 direct fallback 也没有构出来。**
+**这个 frontier 在当前这轮 mixed planning 里，既没有可接受的 GVD plan，也没有可接受的 direct plan。**
 
 通常只有两种原因：
 
@@ -436,7 +478,7 @@ GVD path 不是从 frontier 本身开始，而是：
 2. 获取/重建 GVD
 3. 搜索当前 frontier 列表
 4. 如果附近没有 frontier，并且当前没有 locked frontier，再扩到全图搜索
-5. 刷新 `known_frontiers_`
+5. 刷新 `frontier state graph`
 6. 得到：
    - `observed_valid`
    - `cached_valid`
@@ -447,12 +489,13 @@ GVD path 不是从 frontier 本身开始，而是：
 
 1. 尝试在当前 frontier 列表中匹配它
 2. 如果匹配不到，也继续保留该 locked frontier
-3. 对这个 locked frontier 重新构造 plan
+3. 对这个 locked frontier 重新跑同一套 `mixed planning evaluation`
 
 如果 locked frontier：
 
 - 没有 GVD anchor
 - 没有 same-component GVD path
+- 只能生成一个已经到过、而且没有推进的旧 anchor
 - 规划输入没 ready
 
 则不会立刻放弃，而是先累计失败，再决定是否黑名单。
@@ -463,8 +506,11 @@ GVD path 不是从 frontier 本身开始，而是：
 
 1. 当前 frontier 列表
 2. 缓存 frontier 列表
-3. 如果本地都不行，再扩到全图 frontier 列表
-4. 如果还是都不行，再尝试 direct fallback
+3. 对每个 frontier node 做一次统一的 `mixed planning evaluation`
+   - 优先尝试 GVD route
+   - GVD 不可用时，如果 direct path 安全，则直接选 `DirectGoal`
+   - 两者都不行，就把该 frontier node 记成 `Deferred`
+4. 如果本地都不行，再扩到全图 frontier graph 的 observed/cached 节点
 
 ### 9.6 真的没有可执行 frontier 时
 
@@ -506,6 +552,10 @@ Nav2 成功只代表：
 只有在 explorer 判断：
 
 - 当前 goal 已经真正到 frontier 附近
+
+或者当前 mixed planning evaluation 已经说明：
+
+- 这个 frontier 的 GVD goal 本身就已经覆盖到 frontier
 
 才会 `complete_frontier(...)`。
 
@@ -690,21 +740,22 @@ Nav2 成功只代表：
 
 这句的准确含义不是“地图上没有 frontier”，而是：
 
-**当前 observed 列表 + cached 列表里，没有一个 frontier 在当前约束下能形成可 dispatch 的 plan。**
+**当前 observed frontier nodes + cached frontier nodes 里，没有一个 frontier 在当前 mixed planning 约束下能形成可 dispatch 的 plan。**
 
 ## 14. 当前机制的一句总结
 
 当前实现的真实链条可以概括成：
 
 1. 机器人附近 BFS 找 frontier
-2. frontier 进入 observed list
-3. 和 known frontier cache 合并成候选池
+2. frontier 进入 frontier state graph 的 `observed nodes`
+3. 历史 frontier 以 `cached nodes` 保留在同一张 graph 里
 4. frontier 只能吸到 robot 当前 GVD 连通分量
-5. 优先找 same-component GVD path
-6. GVD path 存在就走 `NavigateThroughPoses`
-7. GVD path 不存在就尝试 direct fallback
-8. direct fallback 也失败就等待地图变化
-9. segment 成功不等于 frontier 完成，只有真正靠近 frontier 才 `complete`
+5. 对每个 frontier node 做 mixed planning evaluation
+6. 优先找 same-component GVD path
+7. GVD path 可用就走 `NavigateThroughPoses`
+8. GVD path 不可用但 direct path 安全就走 `DirectGoal`
+9. 两者都失败就把 frontier node 记成 `Deferred`
+10. segment 成功不等于 frontier 完成，只有真正靠近 frontier 才 `complete`
 
 如果后面要继续讨论“哪里错了”，建议按这 9 步逐步定位，而不是只看最终停住的现象。
 
