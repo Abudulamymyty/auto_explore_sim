@@ -219,6 +219,29 @@ frontier node 退出活跃候选，主要只有两类终态：
 
 **frontier node 进入终态，不再参与活跃候选选择。**
 
+### 4.8 导航前的 frontier 复核
+
+当前实现又补了一层非常重要的保护：
+
+- `observed frontier`
+  - 直接来自当前这轮 `FrontierSearch::search()`，默认认为已经满足 frontier 条件
+- `cached frontier`
+  - 在真正进入 mixed planning 之前，会在**当前地图**上再做一次局部复核
+- `locked frontier`
+  - 如果当前轮已经不在 `observed frontier` 里，也会先做同样的复核
+
+复核的判据不是“它以前是不是 frontier”，而是：
+
+**它在当前地图上，附近还能不能重新找到一个满足 `min_frontier_size` 的 frontier cluster。**
+
+如果复核失败，说明这个目标虽然还残留在 graph / 缓存里，但现在实际上已经：
+
+- 落进 free 区
+- 被新的观测吃掉
+- 或者不再是合法 frontier
+
+这时系统不会继续导航过去，而是把它从“待访问 frontier”语义里移除。
+
 ## 5. GVD 构建机制
 
 ### 5.1 GVD 的输入
@@ -327,6 +350,28 @@ frontier node 退出活跃候选，主要只有两类终态：
 
 - `has_gvd_anchor = false`
 
+### 6.1.1 当前的 snap 是“两段式”的
+
+现在 same-component snap 不是只试一次固定半径，而是：
+
+1. 先用常规 `gvd_snap_radius`
+2. 如果当前分量里 still 没有 anchor
+3. 再用一个**受控的扩展半径**再试一次
+
+但注意，这个扩展只影响：
+
+- 搜索范围
+
+不会改变：
+
+- `frontier 只能吸到 robot 当前所在 GVD 分量`
+
+所以它的设计目标不是放松拓扑约束，而是减少这种情况：
+
+- frontier 明明在当前已知自由区方向上
+- 只是因为固定 snap 半径太小
+- 就过早报 `no usable GVD anchor within snap radius`
+
 ### 6.2 吸附的真实半径
 
 当前代码已经修过一个 bug：
@@ -418,6 +463,23 @@ GVD path 不是从 frontier 本身开始，而是：
 3. 这条 free-space path 的最小 clearance `>= direct_frontier_min_clearance_cells`
 
 时才会返回一个 `DirectGoal` 计划。
+
+### 8.2 现在不会在同一张图上太早 direct fallback
+
+为了避免“其实这张更新后的地图已经快要长出可用 GVD，但系统太快 fallback”这种情况，
+当前 direct fallback 又多了一层保守判据：
+
+- 如果某个 frontier 在**当前 map content** 上第一次评估时：
+  - GVD anchor / GVD path 不可用
+  - 但 direct fallback 可用
+- 系统不会立刻切到 `DirectGoal`
+- 而是先 `Deferred` 一次，让这张图先得到“一次额外的 GVD 机会”
+
+只有同一 frontier 在同一张 map content 下再次评估时，direct fallback 才会真正放行。
+
+所以现在 direct fallback 更像：
+
+**同图首轮 defer，次轮再允许进入 mixed planning 的 direct 分支。**
 
 当前参数：
 
@@ -581,6 +643,30 @@ Nav2 成功只代表：
 
 之后过期。
 
+### 10.5 `blacklist_timeout` 到期后不会直接复活
+
+这是最近补的另一个重要行为。
+
+以前黑名单一到期，这个 frontier 就可能直接重新出现。问题在于：
+
+- 它虽然当时因为不可达/不可执行被黑名单
+- 但后续机器人可能已经从别的方向把那片区域探索掉了
+- 如果它一过期就复活，会造成无意义回访
+
+现在流程变成：
+
+1. 黑名单时间到了
+2. 先在**当前地图**上重新检查这个点附近是否 still 是合法 frontier
+3. 如果已经不满足 frontier 条件
+   - 直接转成 `Completed`
+   - 不再复活
+4. 只有它在当前地图上仍然是合法 frontier
+   - 才允许从 blacklist 中恢复
+
+所以现在 blacklist 过期不再等价于“无条件重新可选”，而是：
+
+**先验活，再决定是否复活。**
+
 ## 11. 为什么系统会“看起来还有 frontier，但 robot 停住”
 
 这通常不是单一原因，而是下面几类机制叠加。
@@ -595,6 +681,12 @@ Nav2 成功只代表：
 
 - frontier 有
 - 但在机器人当前 GVD 连通分量里，`gvd_snap_radius` 内没有可吸附点
+
+需要注意的是，当前实现已经不是“固定半径只试一次”。
+所以如果你仍然看到大量这条日志，它更可能意味着：
+
+- 当前 robot 所在 GVD 分量真的离这些 frontier 太远
+- 或者这片区域的 GVD 还没有在当前地图上长出来
 
 ### 11.2 frontier 有 anchor，但没有 same-component GVD route
 

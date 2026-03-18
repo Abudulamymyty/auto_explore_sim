@@ -67,7 +67,7 @@ frontier_explorer:
     # --- GVD (Voronoi Skeleton) ---
     # Minimum distance-to-obstacle in cells for a GVD point to be valid.
     # Filters out skeleton branches too close to walls.
-    gvd_min_clearance: 5
+    gvd_min_clearance: 10
 
     # Maximum search radius (metres) when snapping a frontier goal to the
     # nearest GVD point.  If no GVD point is found within this radius,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,14 @@ public:
     const std::pair<double, double> & robot_xy,
     const std::vector<double> & dist_map,
     const FrontierSearchConfig & config);
+
+  static std::optional<Frontier> revalidate_nearby_frontier(
+    const GridMapView & grid,
+    const Frontier & frontier,
+    const std::pair<double, double> & robot_xy,
+    const std::vector<double> & dist_map,
+    const FrontierSearchConfig & config,
+    double match_radius);
 };
 
 }  // namespace auto_explore_sim

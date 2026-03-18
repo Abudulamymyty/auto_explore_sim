@@ -66,6 +66,37 @@ std::optional<std::pair<int, int>> nearest_free_cell(
   return std::nullopt;
 }
 
+std::optional<std::pair<int, int>> nearest_frontier_cell(
+  const GridMapView & grid, int sx, int sy, int max_radius)
+{
+  if (grid.in_bounds(sx, sy) && is_frontier_cell(grid, sx, sy)) {
+    return std::make_pair(sx, sy);
+  }
+
+  for (int r = 1; r <= max_radius; ++r) {
+    for (int dx = -r; dx <= r; ++dx) {
+      for (int dy : {-r, r}) {
+        const int nx = sx + dx;
+        const int ny = sy + dy;
+        if (grid.in_bounds(nx, ny) && is_frontier_cell(grid, nx, ny)) {
+          return std::make_pair(nx, ny);
+        }
+      }
+    }
+    for (int dy = -r + 1; dy < r; ++dy) {
+      for (int dx : {-r, r}) {
+        const int nx = sx + dx;
+        const int ny = sy + dy;
+        if (grid.in_bounds(nx, ny) && is_frontier_cell(grid, nx, ny)) {
+          return std::make_pair(nx, ny);
+        }
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
 Frontier build_frontier(
   const GridMapView & grid,
   int sx,
@@ -222,6 +253,59 @@ std::vector<Frontier> FrontierSearch::search(
       return a.size > b.size;
     });
   return frontiers;
+}
+
+std::optional<Frontier> FrontierSearch::revalidate_nearby_frontier(
+  const GridMapView & grid,
+  const Frontier & frontier,
+  const std::pair<double, double> & robot_xy,
+  const std::vector<double> & dist_map,
+  const FrontierSearchConfig & config,
+  double match_radius)
+{
+  if (!grid.valid() || dist_map.size() != grid.cells->size()) {
+    return std::nullopt;
+  }
+
+  const int mx = static_cast<int>(
+    std::floor((frontier.centroid_x - grid.origin_x) / grid.resolution));
+  const int my = static_cast<int>(
+    std::floor((frontier.centroid_y - grid.origin_y) / grid.resolution));
+  if (!grid.in_bounds(mx, my)) {
+    return std::nullopt;
+  }
+
+  const int search_radius_cells = std::max(
+    1, static_cast<int>(std::ceil(match_radius / grid.resolution)));
+  const auto frontier_seed = nearest_frontier_cell(grid, mx, my, search_radius_cells);
+  if (!frontier_seed) {
+    return std::nullopt;
+  }
+
+  enum : uint8_t {
+    kUnvisited = 0,
+    kMapOpen = 1,
+    kMapClosed = 2,
+    kFrontierOpen = 3,
+    kFrontierClosed = 4
+  };
+  std::vector<uint8_t> state(
+    static_cast<size_t>(grid.width * grid.height), kUnvisited);
+  Frontier validated = build_frontier(
+    grid, frontier_seed->first, frontier_seed->second, state, robot_xy, dist_map,
+    config);
+  if (validated.size < config.min_frontier_size) {
+    return std::nullopt;
+  }
+
+  const double centroid_shift = std::hypot(
+    validated.centroid_x - frontier.centroid_x,
+    validated.centroid_y - frontier.centroid_y);
+  if (centroid_shift > match_radius) {
+    return std::nullopt;
+  }
+
+  return validated;
 }
 
 }  // namespace auto_explore_sim
